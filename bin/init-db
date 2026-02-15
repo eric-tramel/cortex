@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_PATH="$PROJECT_ROOT/config/ingestor.toml"
+CONFIG_PATH="${CORTEX_CONFIG:-$HOME/.cortex/config.toml}"
 SQL_DIR="$PROJECT_ROOT/sql"
 
 while [[ $# -gt 0 ]]; do
@@ -23,8 +23,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
-  echo "config not found: $CONFIG_PATH" >&2
-  exit 1
+  mkdir -p "$(dirname "$CONFIG_PATH")"
+  cp "$PROJECT_ROOT/config/cortex.toml" "$CONFIG_PATH"
 fi
 
 if [[ ! -d "$SQL_DIR" ]]; then

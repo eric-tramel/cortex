@@ -2,7 +2,7 @@
 
 ## System Objective
 
-Cortex converts an append-heavy JSONL stream under `~/.codex/sessions/**/*.jsonl` into a local, queryable corpus that supports both rapid operational inspection and faithful trace reconstruction. This is a single-node operational index, not a distributed analytics system: [ClickHouse](https://github.com/ClickHouse/ClickHouse) binds to loopback, state is rooted under `~/.cortex`, and lifecycle is managed by local scripts or launchd. [src: config/ingestor.toml:L11, config/clickhouse.xml:L10, config/clickhouse.xml:L17, bin/start-clickhouse:L5]
+Cortex converts append-heavy JSONL streams from `~/.codex/sessions/**/*.jsonl` and `~/.claude/projects/**/*.jsonl` into a local, queryable corpus that supports both rapid operational inspection and faithful trace reconstruction. This is a single-node operational index, not a distributed analytics system: [ClickHouse](https://github.com/ClickHouse/ClickHouse) binds to loopback, state is rooted under `~/.cortex`, and lifecycle is managed by local scripts or launchd. [src: config/ingestor.toml:L21-L33, config/clickhouse.xml:L10, config/clickhouse.xml:L17, bin/start-clickhouse:L5]
 
 The design prioritizes low append-to-visibility latency, replay fidelity across evolving record formats, and a thin retrieval process that relies on write-time index maintenance. These priorities drive the ingestion/runtime and schema choices documented below. [src: rust/ingestor/src/ingestor.rs:L45, rust/ingestor/src/normalize.rs:L336, sql/004_search_index.sql:L28, rust/codex-mcp/src/main.rs:L337]
 

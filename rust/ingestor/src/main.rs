@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 fn parse_config_path() -> PathBuf {
     let mut args = std::env::args().skip(1);
-    let mut config_path = PathBuf::from("config/ingestor.toml");
+    let mut config_path = default_config_path();
 
     while let Some(arg) = args.next() {
         if arg == "--config" {
@@ -25,10 +25,28 @@ fn parse_config_path() -> PathBuf {
     config_path
 }
 
+fn default_config_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = PathBuf::from(home).join(".cortex").join("config.toml");
+        if path.exists() {
+            return path;
+        }
+    }
+
+    let repo_default = PathBuf::from("config/cortex.toml");
+    if repo_default.exists() {
+        return repo_default;
+    }
+
+    PathBuf::from("config/ingestor.toml")
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .init();
 

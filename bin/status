@@ -81,9 +81,9 @@ fi
 
 if [[ "$CLICKHOUSE_OK" -eq 1 ]]; then
   RAW_COUNT="$(curl -fsS "http://127.0.0.1:8123/?query=SELECT%20count()%20FROM%20cortex.raw_events")"
-  NORM_COUNT="$(curl -fsS "http://127.0.0.1:8123/?query=SELECT%20count()%20FROM%20cortex.normalized_events")"
+  EVENT_COUNT="$(curl -fsS "http://127.0.0.1:8123/?query=SELECT%20count()%20FROM%20cortex.events")"
   echo "raw_events: $RAW_COUNT"
-  echo "normalized_events: $NORM_COUNT"
+  echo "events: $EVENT_COUNT"
 fi
 
 if [[ "$HB_TABLE" != "0" ]] && [[ -n "$LAST_HB" ]]; then

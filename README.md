@@ -1,11 +1,11 @@
 # cortex
 
-Local ClickHouse-backed realtime indexer for Codex session JSONL logs.
+Local ClickHouse-backed realtime indexer for Codex session JSONL logs and Claude code traces.
 
 ## What it does
-- Watches `~/.codex/sessions/**/*.jsonl` in realtime.
+- Watches `~/.codex/sessions/**/*.jsonl` and `~/.claude/projects/**/*.jsonl` for realtime ingestion.
 - Backfills all historical session files on first run.
-- Normalizes new and legacy record formats (`response_item`, `event_msg`, top-level legacy types, `compacted`).
+- Normalizes Codex and Claude record families into a generic schema (`events`, `tool_io`, `event_links`).
 - Preserves metadata needed to reconstruct complete traces: roles, tool calls/outputs, turn sequence, source offsets, and raw payloads.
 - Builds realtime lexical index tables for BM25-style retrieval (`search_documents`, `search_postings`, corpus/term stats).
 - Includes a Rust stdio MCP server (`codex-mcp`) with `search` and `open` tools.
@@ -43,7 +43,8 @@ make docs-rewrite-report
 
 Optional environment configuration:
 - `CORTEX_HOME` overrides the default runtime state path (`~/.cortex`)
-- `CORTEX_MCP_CONFIG` selects the MCP config passed to `bin/run-codex-mcp`
+- `CORTEX_CONFIG` selects the shared config file (default: `~/.cortex/config.toml`)
+- `CORTEX_MCP_CONFIG` can override only the MCP runtime config path
 
 ## Quick start
 ```bash
@@ -74,7 +75,7 @@ cd ~/src/cortex
 bin/run-codex-mcp
 ```
 
-Config defaults to `config/codex-mcp.toml` (or `config/ingestor.toml` if not present) and can be overridden with:
+Config defaults to `~/.cortex/config.toml` (auto-seeded from `config/cortex.toml`) and can be overridden with:
 ```bash
 bin/run-codex-mcp --config /path/to/config.toml
 ```

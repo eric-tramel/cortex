@@ -1,3 +1,10 @@
+DROP VIEW IF EXISTS cortex.mv_search_documents_from_normalized;
+DROP VIEW IF EXISTS cortex.mv_search_documents_from_compacted;
+DROP VIEW IF EXISTS cortex.mv_search_documents_from_events;
+DROP VIEW IF EXISTS cortex.mv_search_postings;
+DROP VIEW IF EXISTS cortex.mv_search_term_stats;
+DROP VIEW IF EXISTS cortex.mv_search_corpus_stats;
+
 CREATE TABLE IF NOT EXISTS cortex.search_documents (
   doc_version UInt64,
   ingested_at DateTime64(3),
@@ -5,6 +12,8 @@ CREATE TABLE IF NOT EXISTS cortex.search_documents (
   compacted_parent_uid String,
   session_id String,
   session_date Date,
+  source_name LowCardinality(String) DEFAULT '',
+  provider LowCardinality(String) DEFAULT '',
   source_file String,
   source_generation UInt32,
   source_line_no UInt64,
@@ -25,58 +34,38 @@ ENGINE = ReplacingMergeTree(doc_version)
 PARTITION BY toYYYYMM(ingested_at)
 ORDER BY (event_uid);
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS cortex.mv_search_documents_from_normalized
-TO cortex.search_documents
-AS
-SELECT
-  event_version AS doc_version,
-  ingested_at,
-  event_uid,
-  '' AS compacted_parent_uid,
-  session_id,
-  session_date,
-  source_file,
-  source_generation,
-  source_line_no,
-  source_offset,
-  source_ref,
-  record_ts,
-  event_class,
-  payload_type,
-  actor_role,
-  name,
-  phase,
-  text_content,
-  payload_json,
-  token_usage_json
-FROM cortex.normalized_events
-WHERE lengthUTF8(replaceRegexpAll(text_content, '\\s+', '')) > 0;
+ALTER TABLE cortex.search_documents
+  ADD COLUMN IF NOT EXISTS source_name LowCardinality(String) DEFAULT '' AFTER session_date;
+ALTER TABLE cortex.search_documents
+  ADD COLUMN IF NOT EXISTS provider LowCardinality(String) DEFAULT '' AFTER source_name;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS cortex.mv_search_documents_from_compacted
+CREATE MATERIALIZED VIEW IF NOT EXISTS cortex.mv_search_documents_from_events
 TO cortex.search_documents
 AS
 SELECT
   event_version AS doc_version,
   ingested_at,
   event_uid,
-  compacted_parent_uid,
+  origin_event_id AS compacted_parent_uid,
   session_id,
   session_date,
+  source_name,
+  provider,
   source_file,
   source_generation,
   source_line_no,
   source_offset,
   source_ref,
   record_ts,
-  event_class,
+  event_kind AS event_class,
   payload_type,
-  actor_role,
-  name,
-  phase,
+  actor_kind AS actor_role,
+  tool_name AS name,
+  if(tool_phase != '', tool_phase, op_status) AS phase,
   text_content,
   payload_json,
   token_usage_json
-FROM cortex.compacted_expanded_events
+FROM cortex.events
 WHERE lengthUTF8(replaceRegexpAll(text_content, '\\s+', '')) > 0;
 
 CREATE TABLE IF NOT EXISTS cortex.search_postings (
@@ -84,6 +73,8 @@ CREATE TABLE IF NOT EXISTS cortex.search_postings (
   term String,
   doc_id String,
   session_id String,
+  source_name LowCardinality(String) DEFAULT '',
+  provider LowCardinality(String) DEFAULT '',
   event_class LowCardinality(String),
   payload_type LowCardinality(String),
   actor_role LowCardinality(String),
@@ -97,6 +88,11 @@ ENGINE = ReplacingMergeTree(post_version)
 PARTITION BY cityHash64(term) % 32
 ORDER BY (term, doc_id);
 
+ALTER TABLE cortex.search_postings
+  ADD COLUMN IF NOT EXISTS source_name LowCardinality(String) DEFAULT '' AFTER session_id;
+ALTER TABLE cortex.search_postings
+  ADD COLUMN IF NOT EXISTS provider LowCardinality(String) DEFAULT '' AFTER source_name;
+
 CREATE MATERIALIZED VIEW IF NOT EXISTS cortex.mv_search_postings
 TO cortex.search_postings
 AS
@@ -105,6 +101,8 @@ SELECT
   d.term,
   d.event_uid AS doc_id,
   d.session_id,
+  d.source_name,
+  d.provider,
   d.event_class,
   d.payload_type,
   d.actor_role,
@@ -119,6 +117,8 @@ FROM
     doc_version,
     event_uid,
     session_id,
+    source_name,
+    provider,
     event_class,
     payload_type,
     actor_role,
@@ -136,6 +136,8 @@ GROUP BY
   d.term,
   d.event_uid,
   d.session_id,
+  d.source_name,
+  d.provider,
   d.event_class,
   d.payload_type,
   d.actor_role,
@@ -204,6 +206,8 @@ CREATE TABLE IF NOT EXISTS cortex.search_hit_log (
   rank UInt16,
   event_uid String,
   session_id String,
+  source_name LowCardinality(String) DEFAULT '',
+  provider LowCardinality(String) DEFAULT '',
   score Float64,
   matched_terms UInt16,
   doc_len UInt32,
@@ -216,6 +220,11 @@ CREATE TABLE IF NOT EXISTS cortex.search_hit_log (
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (query_id, rank, ts);
+
+ALTER TABLE cortex.search_hit_log
+  ADD COLUMN IF NOT EXISTS source_name LowCardinality(String) DEFAULT '' AFTER session_id;
+ALTER TABLE cortex.search_hit_log
+  ADD COLUMN IF NOT EXISTS provider LowCardinality(String) DEFAULT '' AFTER source_name;
 
 CREATE TABLE IF NOT EXISTS cortex.search_interaction_log (
   ts DateTime64(3) DEFAULT now64(3),

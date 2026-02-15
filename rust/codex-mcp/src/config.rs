@@ -196,9 +196,21 @@ pub fn resolve_config_path(raw_path: Option<PathBuf>) -> PathBuf {
         return path;
     }
 
-    let default_path = PathBuf::from("config/codex-mcp.toml");
+    if let Some(home) = std::env::var_os("HOME") {
+        let shared = PathBuf::from(home).join(".cortex").join("config.toml");
+        if shared.exists() {
+            return shared;
+        }
+    }
+
+    let default_path = PathBuf::from("config/cortex.toml");
     if default_path.exists() {
         return default_path;
+    }
+
+    let legacy = PathBuf::from("config/codex-mcp.toml");
+    if legacy.exists() {
+        return legacy;
     }
 
     PathBuf::from("config/ingestor.toml")

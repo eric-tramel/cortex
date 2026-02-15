@@ -2,8 +2,13 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_PATH="$PROJECT_ROOT/config/ingestor.toml"
+CONFIG_PATH="${CORTEX_CONFIG:-$HOME/.cortex/config.toml}"
 BINARY_PATH="$PROJECT_ROOT/rust/ingestor/target/release/cortex-ingestor"
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  mkdir -p "$(dirname "$CONFIG_PATH")"
+  cp "$PROJECT_ROOT/config/cortex.toml" "$CONFIG_PATH"
+fi
 
 for _ in $(seq 1 180); do
   if curl -fsS "http://127.0.0.1:8123/?query=SELECT%201" >/dev/null 2>&1; then

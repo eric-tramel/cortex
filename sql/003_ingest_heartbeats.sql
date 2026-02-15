@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS cortex.ingest_heartbeats (
   files_active UInt32,
   files_watched UInt32,
   rows_raw_written UInt64,
-  rows_norm_written UInt64,
+  rows_events_written UInt64,
   rows_errors_written UInt64,
   flush_latency_ms UInt32,
   append_to_visible_p50_ms UInt32,

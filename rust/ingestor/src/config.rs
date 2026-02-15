@@ -3,6 +3,20 @@ use serde::Deserialize;
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct IngestSource {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub glob: String,
+    #[serde(default)]
+    pub watch_root: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ClickHouseConfig {
     #[serde(default = "default_ch_url")]
     pub url: String,
@@ -22,8 +36,8 @@ pub struct ClickHouseConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IngestConfig {
-    #[serde(default = "default_sessions_glob")]
-    pub sessions_glob: String,
+    #[serde(default = "default_sources")]
+    pub sources: Vec<IngestSource>,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     #[serde(default = "default_flush_interval_seconds")]
@@ -74,8 +88,27 @@ fn default_wait_for_async_insert() -> bool {
     true
 }
 
-fn default_sessions_glob() -> String {
-    "~/.codex/sessions/**/*.jsonl".to_string()
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_sources() -> Vec<IngestSource> {
+    vec![
+        IngestSource {
+            name: "codex".to_string(),
+            provider: "codex".to_string(),
+            enabled: true,
+            glob: "~/.codex/sessions/**/*.jsonl".to_string(),
+            watch_root: "~/.codex/sessions".to_string(),
+        },
+        IngestSource {
+            name: "claude".to_string(),
+            provider: "claude".to_string(),
+            enabled: true,
+            glob: "~/.claude/projects/**/*.jsonl".to_string(),
+            watch_root: "~/.claude/projects".to_string(),
+        },
+    ]
 }
 
 fn default_batch_size() -> usize {
@@ -128,8 +161,34 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
         .with_context(|| format!("failed to read config {}", path.as_ref().display()))?;
     let mut cfg: AppConfig = toml::from_str(&content).context("failed to parse TOML config")?;
 
-    cfg.ingest.sessions_glob = expand_path(&cfg.ingest.sessions_glob);
+    for source in &mut cfg.ingest.sources {
+        source.glob = expand_path(&source.glob);
+        source.watch_root = if source.watch_root.trim().is_empty() {
+            watch_root_from_glob(&source.glob)
+        } else {
+            expand_path(&source.watch_root)
+        };
+    }
     cfg.ingest.state_dir = expand_path(&cfg.ingest.state_dir);
 
     Ok(cfg)
+}
+
+fn watch_root_from_glob(glob_pattern: &str) -> String {
+    if let Some(idx) = glob_pattern.find("/**") {
+        return glob_pattern[..idx].to_string();
+    }
+
+    if let Some(idx) = glob_pattern.find('*') {
+        let prefix = &glob_pattern[..idx];
+        let path = std::path::Path::new(prefix);
+        if let Some(parent) = path.parent() {
+            return parent.to_string_lossy().to_string();
+        }
+    }
+
+    std::path::Path::new(glob_pattern)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| glob_pattern.to_string())
 }

@@ -1,5 +1,5 @@
 use crate::clickhouse::ClickHouseClient;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, IngestSource};
 use crate::model::{Checkpoint, RowBatch};
 use crate::normalize::normalize_record;
 use anyhow::{Context, Result};
@@ -8,7 +8,6 @@ use notify::{Event, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,17 +18,31 @@ use tracing::{debug, error, info, warn};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+#[derive(Debug, Clone)]
+struct WorkItem {
+    source_name: String,
+    provider: String,
+    path: String,
+}
+
+impl WorkItem {
+    fn key(&self) -> String {
+        format!("{}\n{}", self.source_name, self.path)
+    }
+}
+
 #[derive(Default)]
 struct DispatchState {
     pending: HashSet<String>,
     inflight: HashSet<String>,
     dirty: HashSet<String>,
+    item_by_key: HashMap<String, WorkItem>,
 }
 
 #[derive(Default)]
 struct Metrics {
     raw_rows_written: AtomicU64,
-    norm_rows_written: AtomicU64,
+    event_rows_written: AtomicU64,
     err_rows_written: AtomicU64,
     last_flush_ms: AtomicU64,
     flush_failures: AtomicU64,
@@ -43,6 +56,20 @@ enum SinkMessage {
 }
 
 pub async fn run_ingestor(config: AppConfig) -> Result<()> {
+    let enabled_sources: Vec<IngestSource> = config
+        .ingest
+        .sources
+        .iter()
+        .filter(|src| src.enabled)
+        .cloned()
+        .collect();
+
+    if enabled_sources.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no enabled ingest sources found in config.ingest.sources"
+        ));
+    }
+
     let clickhouse = ClickHouseClient::new(config.clickhouse.clone())?;
     clickhouse.ping().await.context("clickhouse ping failed")?;
 
@@ -51,16 +78,25 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         .await
         .context("failed to load checkpoints from clickhouse")?;
 
-    info!("loaded {} checkpoints", checkpoint_map.len());
+    info!(
+        "loaded {} checkpoints across {} sources",
+        checkpoint_map.len(),
+        enabled_sources.len()
+    );
 
     let checkpoints = Arc::new(RwLock::new(checkpoint_map));
     let dispatch = Arc::new(Mutex::new(DispatchState::default()));
     let metrics = Arc::new(Metrics::default());
 
-    let process_queue_capacity = config.ingest.max_inflight_batches.saturating_mul(16).max(1024);
-    let (process_tx, mut process_rx) = mpsc::channel::<String>(process_queue_capacity);
-    let (sink_tx, sink_rx) = mpsc::channel::<SinkMessage>(config.ingest.max_inflight_batches.max(16));
-    let (watch_path_tx, watch_path_rx) = mpsc::unbounded_channel::<String>();
+    let process_queue_capacity = config
+        .ingest
+        .max_inflight_batches
+        .saturating_mul(16)
+        .max(1024);
+    let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(process_queue_capacity);
+    let (sink_tx, sink_rx) =
+        mpsc::channel::<SinkMessage>(config.ingest.max_inflight_batches.max(16));
+    let (watch_path_tx, watch_path_rx) = mpsc::unbounded_channel::<WorkItem>();
 
     let sink_handle = spawn_sink_task(
         config.clone(),
@@ -82,13 +118,14 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         let cfg_clone = config.clone();
 
         tokio::spawn(async move {
-            while let Some(path) = process_rx.recv().await {
+            while let Some(work) = process_rx.recv().await {
                 metrics_clone.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                let key = work.key();
 
                 {
                     let mut state = dispatch_clone.lock().expect("dispatch mutex poisoned");
-                    state.pending.remove(&path);
-                    state.inflight.insert(path.clone());
+                    state.pending.remove(&key);
+                    state.inflight.insert(key.clone());
                 }
 
                 let permit = match sem_clone.clone().acquire_owned().await {
@@ -107,33 +144,36 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
                     let _permit = permit;
                     if let Err(exc) = process_file(
                         &cfg_worker,
-                        &path,
+                        &work,
                         checkpoints_worker,
                         sink_tx_worker,
                         &metrics_worker,
                     )
                     .await
                     {
-                        error!("failed processing {}: {exc}", path);
+                        error!(
+                            "failed processing {}:{}: {exc}",
+                            work.source_name, work.path
+                        );
                         *metrics_worker
                             .last_error
                             .lock()
                             .expect("metrics last_error mutex poisoned") = exc.to_string();
                     }
 
-                    let mut reschedule = false;
+                    let mut reschedule: Option<WorkItem> = None;
                     {
                         let mut state = dispatch_worker.lock().expect("dispatch mutex poisoned");
-                        state.inflight.remove(&path);
-                        if state.dirty.remove(&path) {
-                            if state.pending.insert(path.clone()) {
-                                reschedule = true;
+                        state.inflight.remove(&key);
+                        if state.dirty.remove(&key) {
+                            if state.pending.insert(key.clone()) {
+                                reschedule = state.item_by_key.get(&key).cloned();
                             }
                         }
                     }
 
-                    if reschedule {
-                        if process_tx_worker.send(path.clone()).await.is_ok() {
+                    if let Some(item) = reschedule {
+                        if process_tx_worker.send(item).await.is_ok() {
                             metrics_worker.queue_depth.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -152,23 +192,42 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
 
     let reconcile_handle = spawn_reconcile_task(
         config.clone(),
+        enabled_sources.clone(),
         process_tx.clone(),
         dispatch.clone(),
         metrics.clone(),
     );
 
-    let watcher_thread = spawn_watcher_thread(config.clone(), watch_path_tx)?;
+    let watcher_threads = spawn_watcher_threads(enabled_sources.clone(), watch_path_tx)?;
 
     if config.ingest.backfill_on_start {
-        let files = enumerate_jsonl_files(&config.ingest.sessions_glob)?;
-        info!("startup backfill queueing {} files", files.len());
-        for path in files {
-            enqueue_file(path, &process_tx, &dispatch, &metrics).await;
+        for source in &enabled_sources {
+            let files = enumerate_jsonl_files(&source.glob)?;
+            info!(
+                "startup backfill queueing {} files for source={}",
+                files.len(),
+                source.name
+            );
+            for path in files {
+                enqueue_work(
+                    WorkItem {
+                        source_name: source.name.clone(),
+                        provider: source.provider.clone(),
+                        path,
+                    },
+                    &process_tx,
+                    &dispatch,
+                    &metrics,
+                )
+                .await;
+            }
         }
     }
 
     info!("rust ingestor running; waiting for shutdown signal");
-    tokio::signal::ctrl_c().await.context("signal handler failed")?;
+    tokio::signal::ctrl_c()
+        .await
+        .context("signal handler failed")?;
     info!("shutdown signal received");
 
     drop(process_tx);
@@ -179,72 +238,102 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     processor_handle.abort();
     sink_handle.abort();
 
-    let _ = watcher_thread.thread().id();
+    for handle in watcher_threads {
+        let _ = handle.thread().id();
+    }
 
     Ok(())
 }
 
-fn spawn_watcher_thread(
-    config: AppConfig,
-    tx: mpsc::UnboundedSender<String>,
-) -> Result<std::thread::JoinHandle<()>> {
-    let watch_root = watch_root_from_glob(&config.ingest.sessions_glob);
-    info!("starting watcher on {}", watch_root.display());
+fn spawn_watcher_threads(
+    sources: Vec<IngestSource>,
+    tx: mpsc::UnboundedSender<WorkItem>,
+) -> Result<Vec<std::thread::JoinHandle<()>>> {
+    let mut handles = Vec::<std::thread::JoinHandle<()>>::new();
 
-    let handle = std::thread::spawn(move || {
-        let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
+    for source in sources {
+        let source_name = source.name.clone();
+        let provider = source.provider.clone();
+        let watch_root = std::path::PathBuf::from(source.watch_root.clone());
+        let tx_clone = tx.clone();
 
-        let mut watcher = match notify::recommended_watcher(move |res| {
-            let _ = event_tx.send(res);
-        }) {
-            Ok(watcher) => watcher,
-            Err(exc) => {
-                eprintln!("[cortex-rust] failed to create watcher: {exc}");
+        info!(
+            "starting watcher on {} (source={}, provider={})",
+            watch_root.display(),
+            source_name,
+            provider
+        );
+
+        let handle = std::thread::spawn(move || {
+            let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
+
+            let mut watcher = match notify::recommended_watcher(move |res| {
+                let _ = event_tx.send(res);
+            }) {
+                Ok(watcher) => watcher,
+                Err(exc) => {
+                    eprintln!(
+                        "[cortex-rust] failed to create watcher for {}: {exc}",
+                        source_name
+                    );
+                    return;
+                }
+            };
+
+            if let Err(exc) = watcher.watch(watch_root.as_path(), RecursiveMode::Recursive) {
+                eprintln!(
+                    "[cortex-rust] failed to watch {} ({}): {exc}",
+                    watch_root.display(),
+                    source_name
+                );
                 return;
             }
-        };
 
-        if let Err(exc) = watcher.watch(watch_root.as_path(), RecursiveMode::Recursive) {
-            eprintln!("[cortex-rust] failed to watch {}: {exc}", watch_root.display());
-            return;
-        }
-
-        loop {
-            match event_rx.recv() {
-                Ok(Ok(event)) => {
-                    for path in event.paths {
-                        let _ = tx.send(path.to_string_lossy().to_string());
+            loop {
+                match event_rx.recv() {
+                    Ok(Ok(event)) => {
+                        for path in event.paths {
+                            let _ = tx_clone.send(WorkItem {
+                                source_name: source_name.clone(),
+                                provider: provider.clone(),
+                                path: path.to_string_lossy().to_string(),
+                            });
+                        }
                     }
+                    Ok(Err(exc)) => {
+                        eprintln!("[cortex-rust] watcher event error ({source_name}): {exc}");
+                    }
+                    Err(_) => break,
                 }
-                Ok(Err(exc)) => {
-                    eprintln!("[cortex-rust] watcher event error: {exc}");
-                }
-                Err(_) => break,
             }
-        }
-    });
+        });
 
-    Ok(handle)
+        handles.push(handle);
+    }
+
+    Ok(handles)
 }
 
 fn spawn_debounce_task(
     config: AppConfig,
-    mut rx: mpsc::UnboundedReceiver<String>,
-    process_tx: mpsc::Sender<String>,
+    mut rx: mpsc::UnboundedReceiver<WorkItem>,
+    process_tx: mpsc::Sender<WorkItem>,
     dispatch: Arc<Mutex<DispatchState>>,
     metrics: Arc<Metrics>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let debounce = Duration::from_millis(config.ingest.debounce_ms.max(5));
-        let mut pending = HashMap::<String, Instant>::new();
-        let mut tick = tokio::time::interval(Duration::from_millis((config.ingest.debounce_ms / 2).max(10)));
+        let mut pending = HashMap::<String, (WorkItem, Instant)>::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(
+            (config.ingest.debounce_ms / 2).max(10),
+        ));
 
         loop {
             tokio::select! {
-                maybe_path = rx.recv() => {
-                    match maybe_path {
-                        Some(path) => {
-                            pending.insert(path, Instant::now());
+                maybe_work = rx.recv() => {
+                    match maybe_work {
+                        Some(work) => {
+                            pending.insert(work.key(), (work, Instant::now()));
                         }
                         None => break,
                     }
@@ -257,23 +346,23 @@ fn spawn_debounce_task(
                     let now = Instant::now();
                     let ready: Vec<String> = pending
                         .iter()
-                        .filter_map(|(path, seen_at)| {
+                        .filter_map(|(key, (_, seen_at))| {
                             if now.duration_since(*seen_at) >= debounce {
-                                Some(path.clone())
+                                Some(key.clone())
                             } else {
                                 None
                             }
                         })
                         .collect();
 
-                    for path in ready {
-                        pending.remove(&path);
+                    for key in ready {
+                        if let Some((work, _)) = pending.remove(&key) {
+                            if !work.path.ends_with(".jsonl") {
+                                continue;
+                            }
 
-                        if !path.ends_with(".jsonl") {
-                            continue;
+                            enqueue_work(work, &process_tx, &dispatch, &metrics).await;
                         }
-
-                        enqueue_file(path, &process_tx, &dispatch, &metrics).await;
                     }
                 }
             }
@@ -283,7 +372,8 @@ fn spawn_debounce_task(
 
 fn spawn_reconcile_task(
     config: AppConfig,
-    process_tx: mpsc::Sender<String>,
+    sources: Vec<IngestSource>,
+    process_tx: mpsc::Sender<WorkItem>,
     dispatch: Arc<Mutex<DispatchState>>,
     metrics: Arc<Metrics>,
 ) -> JoinHandle<()> {
@@ -293,15 +383,31 @@ fn spawn_reconcile_task(
 
         loop {
             ticker.tick().await;
-            match enumerate_jsonl_files(&config.ingest.sessions_glob) {
-                Ok(paths) => {
-                    debug!("reconcile scanning {} files", paths.len());
-                    for path in paths {
-                        enqueue_file(path, &process_tx, &dispatch, &metrics).await;
+            for source in &sources {
+                match enumerate_jsonl_files(&source.glob) {
+                    Ok(paths) => {
+                        debug!(
+                            "reconcile scanning {} files for source={}",
+                            paths.len(),
+                            source.name
+                        );
+                        for path in paths {
+                            enqueue_work(
+                                WorkItem {
+                                    source_name: source.name.clone(),
+                                    provider: source.provider.clone(),
+                                    path,
+                                },
+                                &process_tx,
+                                &dispatch,
+                                &metrics,
+                            )
+                            .await;
+                        }
                     }
-                }
-                Err(exc) => {
-                    warn!("reconcile scan failed: {exc}");
+                    Err(exc) => {
+                        warn!("reconcile scan failed for source={}: {exc}", source.name);
+                    }
                 }
             }
         }
@@ -318,13 +424,16 @@ fn spawn_sink_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut raw_rows = Vec::<Value>::new();
-        let mut normalized_rows = Vec::<Value>::new();
-        let mut expanded_rows = Vec::<Value>::new();
+        let mut event_rows = Vec::<Value>::new();
+        let mut link_rows = Vec::<Value>::new();
+        let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
         let mut checkpoint_updates = HashMap::<String, Checkpoint>::new();
 
-        let flush_interval = Duration::from_secs_f64(config.ingest.flush_interval_seconds.max(0.05));
-        let heartbeat_interval = Duration::from_secs_f64(config.ingest.heartbeat_interval_seconds.max(1.0));
+        let flush_interval =
+            Duration::from_secs_f64(config.ingest.flush_interval_seconds.max(0.05));
+        let heartbeat_interval =
+            Duration::from_secs_f64(config.ingest.heartbeat_interval_seconds.max(1.0));
 
         let mut flush_tick = tokio::time::interval(flush_interval);
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
@@ -335,22 +444,24 @@ fn spawn_sink_task(
                     match maybe_msg {
                         Some(SinkMessage::Batch(batch)) => {
                             raw_rows.extend(batch.raw_rows);
-                            normalized_rows.extend(batch.normalized_rows);
-                            expanded_rows.extend(batch.expanded_rows);
+                            event_rows.extend(batch.event_rows);
+                            link_rows.extend(batch.link_rows);
+                            tool_rows.extend(batch.tool_rows);
                             error_rows.extend(batch.error_rows);
                             if let Some(cp) = batch.checkpoint {
                                 merge_checkpoint(&mut checkpoint_updates, cp);
                             }
 
-                            let total_rows = raw_rows.len() + normalized_rows.len() + expanded_rows.len() + error_rows.len();
+                            let total_rows = raw_rows.len() + event_rows.len() + link_rows.len() + tool_rows.len() + error_rows.len();
                             if total_rows >= config.ingest.batch_size {
                                 flush_pending(
                                     &clickhouse,
                                     &checkpoints,
                                     &metrics,
                                     &mut raw_rows,
-                                    &mut normalized_rows,
-                                    &mut expanded_rows,
+                                    &mut event_rows,
+                                    &mut link_rows,
+                                    &mut tool_rows,
                                     &mut error_rows,
                                     &mut checkpoint_updates,
                                 ).await;
@@ -360,14 +471,15 @@ fn spawn_sink_task(
                     }
                 }
                 _ = flush_tick.tick() => {
-                    if !(raw_rows.is_empty() && normalized_rows.is_empty() && expanded_rows.is_empty() && error_rows.is_empty() && checkpoint_updates.is_empty()) {
+                    if !(raw_rows.is_empty() && event_rows.is_empty() && link_rows.is_empty() && tool_rows.is_empty() && error_rows.is_empty() && checkpoint_updates.is_empty()) {
                         flush_pending(
                             &clickhouse,
                             &checkpoints,
                             &metrics,
                             &mut raw_rows,
-                            &mut normalized_rows,
-                            &mut expanded_rows,
+                            &mut event_rows,
+                            &mut link_rows,
+                            &mut tool_rows,
                             &mut error_rows,
                             &mut checkpoint_updates,
                         ).await;
@@ -394,7 +506,7 @@ fn spawn_sink_task(
                         "files_active": files_active,
                         "files_watched": files_watched,
                         "rows_raw_written": metrics.raw_rows_written.load(Ordering::Relaxed),
-                        "rows_norm_written": metrics.norm_rows_written.load(Ordering::Relaxed),
+                        "rows_events_written": metrics.event_rows_written.load(Ordering::Relaxed),
                         "rows_errors_written": metrics.err_rows_written.load(Ordering::Relaxed),
                         "flush_latency_ms": metrics.last_flush_ms.load(Ordering::Relaxed) as u32,
                         "append_to_visible_p50_ms": 0u32,
@@ -409,23 +521,35 @@ fn spawn_sink_task(
             }
         }
 
-        if !(raw_rows.is_empty() && normalized_rows.is_empty() && expanded_rows.is_empty() && error_rows.is_empty() && checkpoint_updates.is_empty()) {
+        if !(raw_rows.is_empty()
+            && event_rows.is_empty()
+            && link_rows.is_empty()
+            && tool_rows.is_empty()
+            && error_rows.is_empty()
+            && checkpoint_updates.is_empty())
+        {
             flush_pending(
                 &clickhouse,
                 &checkpoints,
                 &metrics,
                 &mut raw_rows,
-                &mut normalized_rows,
-                &mut expanded_rows,
+                &mut event_rows,
+                &mut link_rows,
+                &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
-            ).await;
+            )
+            .await;
         }
     })
 }
 
+fn checkpoint_key(source_name: &str, source_file: &str) -> String {
+    format!("{}\n{}", source_name, source_file)
+}
+
 fn merge_checkpoint(pending: &mut HashMap<String, Checkpoint>, checkpoint: Checkpoint) {
-    let key = checkpoint.source_file.clone();
+    let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
     match pending.get(&key) {
         None => {
             pending.insert(key, checkpoint);
@@ -446,8 +570,9 @@ async fn flush_pending(
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
     metrics: &Arc<Metrics>,
     raw_rows: &mut Vec<Value>,
-    normalized_rows: &mut Vec<Value>,
-    expanded_rows: &mut Vec<Value>,
+    event_rows: &mut Vec<Value>,
+    link_rows: &mut Vec<Value>,
+    tool_rows: &mut Vec<Value>,
     error_rows: &mut Vec<Value>,
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
 ) {
@@ -457,6 +582,7 @@ async fn flush_pending(
         .values()
         .map(|cp| {
             json!({
+                "source_name": cp.source_name,
                 "source_file": cp.source_file,
                 "source_inode": cp.source_inode,
                 "source_generation": cp.source_generation,
@@ -469,12 +595,9 @@ async fn flush_pending(
 
     let flush_result = async {
         clickhouse.insert_json_rows("raw_events", raw_rows).await?;
-        clickhouse
-            .insert_json_rows("normalized_events", normalized_rows)
-            .await?;
-        clickhouse
-            .insert_json_rows("compacted_expanded_events", expanded_rows)
-            .await?;
+        clickhouse.insert_json_rows("events", event_rows).await?;
+        clickhouse.insert_json_rows("event_links", link_rows).await?;
+        clickhouse.insert_json_rows("tool_io", tool_rows).await?;
         clickhouse.insert_json_rows("ingest_errors", error_rows).await?;
         clickhouse
             .insert_json_rows("ingest_checkpoints", &checkpoint_rows)
@@ -485,13 +608,15 @@ async fn flush_pending(
 
     match flush_result {
         Ok(()) => {
-            let raw_len = raw_rows.len() as u64;
-            let norm_len = normalized_rows.len() as u64;
-            let err_len = error_rows.len() as u64;
-
-            metrics.raw_rows_written.fetch_add(raw_len, Ordering::Relaxed);
-            metrics.norm_rows_written.fetch_add(norm_len, Ordering::Relaxed);
-            metrics.err_rows_written.fetch_add(err_len, Ordering::Relaxed);
+            metrics
+                .raw_rows_written
+                .fetch_add(raw_rows.len() as u64, Ordering::Relaxed);
+            metrics
+                .event_rows_written
+                .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
+            metrics
+                .err_rows_written
+                .fetch_add(error_rows.len() as u64, Ordering::Relaxed);
             metrics
                 .last_flush_ms
                 .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -499,13 +624,15 @@ async fn flush_pending(
             {
                 let mut state = checkpoints.write().await;
                 for cp in checkpoint_updates.values() {
-                    state.insert(cp.source_file.clone(), cp.clone());
+                    let key = checkpoint_key(&cp.source_name, &cp.source_file);
+                    state.insert(key, cp.clone());
                 }
             }
 
             raw_rows.clear();
-            normalized_rows.clear();
-            expanded_rows.clear();
+            event_rows.clear();
+            link_rows.clear();
+            tool_rows.clear();
             error_rows.clear();
             checkpoint_updates.clear();
         }
@@ -520,28 +647,30 @@ async fn flush_pending(
     }
 }
 
-async fn enqueue_file(
-    path: String,
-    process_tx: &mpsc::Sender<String>,
+async fn enqueue_work(
+    work: WorkItem,
+    process_tx: &mpsc::Sender<WorkItem>,
     dispatch: &Arc<Mutex<DispatchState>>,
     metrics: &Arc<Metrics>,
 ) {
-    if !path.ends_with(".jsonl") {
+    if !work.path.ends_with(".jsonl") {
         return;
     }
 
+    let key = work.key();
     let mut should_send = false;
     {
         let mut state = dispatch.lock().expect("dispatch mutex poisoned");
-        if state.inflight.contains(&path) {
-            state.dirty.insert(path.clone());
-        } else if state.pending.insert(path.clone()) {
+        state.item_by_key.insert(key.clone(), work.clone());
+        if state.inflight.contains(&key) {
+            state.dirty.insert(key.clone());
+        } else if state.pending.insert(key.clone()) {
             should_send = true;
         }
     }
 
     if should_send {
-        if process_tx.send(path).await.is_ok() {
+        if process_tx.send(work).await.is_ok() {
             metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -549,11 +678,13 @@ async fn enqueue_file(
 
 async fn process_file(
     config: &AppConfig,
-    source_file: &str,
+    work: &WorkItem,
     checkpoints: Arc<RwLock<HashMap<String, Checkpoint>>>,
     sink_tx: mpsc::Sender<SinkMessage>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
+    let source_file = &work.path;
+
     let meta = match std::fs::metadata(source_file) {
         Ok(meta) => meta,
         Err(exc) => {
@@ -568,10 +699,11 @@ async fn process_file(
     let inode = 0u64;
 
     let file_size = meta.len();
-
-    let committed = { checkpoints.read().await.get(source_file).cloned() };
+    let cp_key = checkpoint_key(&work.source_name, source_file);
+    let committed = { checkpoints.read().await.get(&cp_key).cloned() };
 
     let mut checkpoint = committed.unwrap_or(Checkpoint {
+        source_name: work.source_name.clone(),
         source_file: source_file.to_string(),
         source_inode: inode,
         source_generation: 1,
@@ -633,6 +765,8 @@ async fn process_file(
             Ok(value) if value.is_object() => value,
             Ok(_) => {
                 batch.error_rows.push(json!({
+                    "source_name": work.source_name,
+                    "provider": work.provider,
                     "source_file": source_file,
                     "source_inode": inode,
                     "source_generation": checkpoint.source_generation,
@@ -646,6 +780,8 @@ async fn process_file(
             }
             Err(exc) => {
                 batch.error_rows.push(json!({
+                    "source_name": work.source_name,
+                    "provider": work.provider,
                     "source_file": source_file,
                     "source_inode": inode,
                     "source_generation": checkpoint.source_generation,
@@ -661,6 +797,8 @@ async fn process_file(
 
         let normalized = normalize_record(
             &parsed,
+            &work.source_name,
+            &work.provider,
             source_file,
             inode,
             checkpoint.source_generation,
@@ -671,19 +809,22 @@ async fn process_file(
 
         session_hint = normalized.session_hint;
         batch.raw_rows.push(normalized.raw_row);
-        batch.normalized_rows.extend(normalized.normalized_rows);
-        batch.expanded_rows.extend(normalized.expanded_rows);
+        batch.event_rows.extend(normalized.event_rows);
+        batch.link_rows.extend(normalized.link_rows);
+        batch.tool_rows.extend(normalized.tool_rows);
         batch.lines_processed = batch.lines_processed.saturating_add(1);
 
         if batch.row_count() >= config.ingest.batch_size {
             let mut chunk = RowBatch::default();
             chunk.raw_rows = std::mem::take(&mut batch.raw_rows);
-            chunk.normalized_rows = std::mem::take(&mut batch.normalized_rows);
-            chunk.expanded_rows = std::mem::take(&mut batch.expanded_rows);
+            chunk.event_rows = std::mem::take(&mut batch.event_rows);
+            chunk.link_rows = std::mem::take(&mut batch.link_rows);
+            chunk.tool_rows = std::mem::take(&mut batch.tool_rows);
             chunk.error_rows = std::mem::take(&mut batch.error_rows);
             chunk.lines_processed = batch.lines_processed;
             batch.lines_processed = 0;
             chunk.checkpoint = Some(Checkpoint {
+                source_name: work.source_name.clone(),
                 source_file: source_file.to_string(),
                 source_inode: inode,
                 source_generation: checkpoint.source_generation,
@@ -700,6 +841,7 @@ async fn process_file(
     }
 
     let final_checkpoint = Checkpoint {
+        source_name: work.source_name.clone(),
         source_file: source_file.to_string(),
         source_inode: inode,
         source_generation: checkpoint.source_generation,
@@ -717,7 +859,10 @@ async fn process_file(
     }
 
     if metrics.queue_depth.load(Ordering::Relaxed) == 0 {
-        debug!("{} caught up at offset {}", source_file, offset);
+        debug!(
+            "{}:{} caught up at offset {}",
+            work.source_name, source_file, offset
+        );
     }
 
     Ok(())
@@ -728,25 +873,6 @@ fn truncate(input: &str, max_chars: usize) -> String {
         return input.to_string();
     }
     input.chars().take(max_chars).collect()
-}
-
-fn watch_root_from_glob(glob_pattern: &str) -> PathBuf {
-    if let Some(idx) = glob_pattern.find("/**") {
-        return PathBuf::from(&glob_pattern[..idx]);
-    }
-
-    if let Some(idx) = glob_pattern.find('*') {
-        let prefix = &glob_pattern[..idx];
-        let path = Path::new(prefix);
-        if let Some(parent) = path.parent() {
-            return parent.to_path_buf();
-        }
-    }
-
-    Path::new(glob_pattern)
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(glob_pattern))
 }
 
 fn enumerate_jsonl_files(glob_pattern: &str) -> Result<Vec<String>> {

@@ -91,14 +91,17 @@ impl ClickHouseClient {
             payload.push(b'\n');
         }
 
-        let query = format!("INSERT INTO {}.{} FORMAT JSONEachRow", self.cfg.database, table);
+        let query = format!(
+            "INSERT INTO {}.{} FORMAT JSONEachRow",
+            self.cfg.database, table
+        );
         self.request(&query, Some(payload), None, true).await?;
         Ok(())
     }
 
     pub async fn load_checkpoints(&self) -> Result<HashMap<String, Checkpoint>> {
         let query = format!(
-            "SELECT source_file, argMax(source_inode, updated_at), argMax(source_generation, updated_at), argMax(last_offset, updated_at), argMax(last_line_no, updated_at), argMax(status, updated_at) FROM {}.ingest_checkpoints GROUP BY source_file FORMAT TabSeparated",
+            "SELECT source_name, source_file, argMax(source_inode, updated_at), argMax(source_generation, updated_at), argMax(last_offset, updated_at), argMax(last_line_no, updated_at), argMax(status, updated_at) FROM {}.ingest_checkpoints GROUP BY source_name, source_file FORMAT TabSeparated",
             self.cfg.database
         );
 
@@ -110,20 +113,22 @@ impl ClickHouseClient {
                 continue;
             }
             let fields: Vec<&str> = line.split('\t').collect();
-            if fields.len() < 6 {
+            if fields.len() < 7 {
                 continue;
             }
 
-            let source_file = fields[0].to_string();
-            let source_inode = fields[1].parse::<u64>().unwrap_or(0);
-            let source_generation = fields[2].parse::<u32>().unwrap_or(1);
-            let last_offset = fields[3].parse::<u64>().unwrap_or(0);
-            let last_line_no = fields[4].parse::<u64>().unwrap_or(0);
-            let status = fields[5].to_string();
+            let source_name = fields[0].to_string();
+            let source_file = fields[1].to_string();
+            let source_inode = fields[2].parse::<u64>().unwrap_or(0);
+            let source_generation = fields[3].parse::<u32>().unwrap_or(1);
+            let last_offset = fields[4].parse::<u64>().unwrap_or(0);
+            let last_line_no = fields[5].parse::<u64>().unwrap_or(0);
+            let status = fields[6].to_string();
 
             map.insert(
-                source_file.clone(),
+                format!("{}\n{}", source_name, source_file),
                 Checkpoint {
+                    source_name,
                     source_file,
                     source_inode,
                     source_generation,
