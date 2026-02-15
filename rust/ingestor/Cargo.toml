@@ -20,3 +20,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 urlencoding = "2.1"
 walkdir = "2.5"
+cortex-config = { path = "../../crates/cortex-config" }
+cortex-clickhouse = { path = "../../crates/cortex-clickhouse" }

@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/cortex-config",
+  "crates/cortex-clickhouse",
+  "crates/cortex-ingest-core",
+  "crates/cortex-mcp-core",
+  "crates/cortex-monitor-core",
+  "apps/cortex-ingest",
+  "apps/cortex-mcp",
+  "apps/cortex-monitor",
+  "apps/cortexctl",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Cortex Maintainers"]

@@ -1,23 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CORTEX_HOME="${CORTEX_HOME:-$HOME/.cortex}"
-INGEST_ROOT="$CORTEX_HOME/ingestor"
-PID_FILE="$INGEST_ROOT/ingestor.pid"
-LOG_FILE="$INGEST_ROOT/ingestor.log"
-RUNNER="$PROJECT_ROOT/bin/run-ingestor-rust-service"
-
-mkdir -p "$INGEST_ROOT"
-
-if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  echo "ingestor already running (pid $(cat "$PID_FILE"))"
-  exit 0
-fi
-
-nohup "$RUNNER" >> "$LOG_FILE" 2>&1 &
-INGEST_PID=$!
-echo "$INGEST_PID" > "$PID_FILE"
-
-echo "ingestor started (pid $INGEST_PID)"
-echo "log file: $LOG_FILE"
+echo "error: start-ingestor has been removed in the cortexctl migration." >&2
+echo "use: bin/cortexctl up" >&2
+exit 64

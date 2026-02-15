@@ -62,7 +62,7 @@ if ! curl -fsS "$CLICKHOUSE_URL/?query=SELECT%201" >/dev/null 2>&1; then
   exit 1
 fi
 
-"$PROJECT_ROOT/bin/init-db" --config "$CONFIG_PATH"
+"$PROJECT_ROOT/bin/cortexctl" db migrate --config "$CONFIG_PATH"
 
 run_sql() {
   local stmt="$1"

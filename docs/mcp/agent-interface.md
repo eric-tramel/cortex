@@ -2,7 +2,7 @@
 
 ## Service Contract
 
-`codex-mcp` is a local, stateless [Model Context Protocol](https://modelcontextprotocol.io/) server that sits on top of ClickHouse-backed Cortex tables and exposes exactly two retrieval primitives to agent runtimes: lexical discovery (`search`) and trace reconstruction (`open`). It does not own ingestion, index construction, or background maintenance. Its contract boundary is intentionally narrow: accept JSON-RPC tool calls over stdio, execute bounded SQL reads against precomputed search structures and trace views, and return either agent-readable prose or full structured JSON. This keeps latency predictable, process startup cheap, and failure domains small enough that host runtimes can restart the process without any reindex step. [src: rust/codex-mcp/src/main.rs:L264-L309, rust/codex-mcp/src/main.rs:L311-L335, rust/codex-mcp/src/main.rs:L1066-L1114]
+`cortex-mcp` is a local, stateless [Model Context Protocol](https://modelcontextprotocol.io/) server that sits on top of ClickHouse-backed Cortex tables and exposes exactly two retrieval primitives to agent runtimes: lexical discovery (`search`) and trace reconstruction (`open`). It does not own ingestion, index construction, or background maintenance. Its contract boundary is intentionally narrow: accept JSON-RPC tool calls over stdio, execute bounded SQL reads against precomputed search structures and trace views, and return either agent-readable prose or full structured JSON. This keeps latency predictable, process startup cheap, and failure domains small enough that host runtimes can restart the process without any reindex step.
 
 Configuration confirms this posture. ClickHouse endpoint, protocol version, result limits, context defaults, and BM25 parameters are loaded from TOML with concrete defaults, and startup fails fast on parse or ping failure. The service therefore has no hidden mutable state that can drift from corpus truth: either it can reach ClickHouse and answer from current tables, or it fails immediately and visibly. [src: rust/codex-mcp/src/config.rs:L5-L65, rust/codex-mcp/src/config.rs:L194-L212, rust/codex-mcp/src/main.rs:L1075-L1081, config/codex-mcp.toml:L1-L25]
 
@@ -155,11 +155,11 @@ fn sql_quote(value: &str) -> String {
 
 ## Integration Guidance for Agents
 
-Integrate `codex-mcp` as a colocated subprocess started by the host agent runtime. The provided wrapper script resolves config location, checks the release binary, and execs the server with `--config`, while the build wrapper compiles the release artifact deterministically. This is the intended operational path because it preserves a single, inspectable command surface across local environments and launch scripts. [src: bin/run-codex-mcp:L4-L18, bin/build-rust-codex-mcp:L4-L14]
+Integrate `cortex-mcp` as a colocated subprocess started by the host agent runtime. The recommended operational path is `bin/cortexctl run mcp --config <path>`, which keeps one command surface across local environments.
 
 For host policy, default to `verbosity=prose` for first-pass retrieval, then issue targeted `verbosity=full` calls when the agent needs exact JSON fields (`payload_json`, `token_usage_json`, or source coordinates). Keep `exclude_codex_mcp=true` unless debugging MCP internals, and avoid raising `max_query_terms` without workload evidence because fanout cost rises rapidly on broad lexical tokens. [src: config/codex-mcp.toml:L15-L25, rust/codex-mcp/src/main.rs:L523-L526, rust/codex-mcp/src/main.rs:L1000-L1018]
 
-For deterministic behavior across environments, pin config in `config/codex-mcp.toml` and avoid implicit fallback to `config/ingestor.toml` except as temporary bootstrap compatibility. The explicit file separates MCP policy from ingestion policy and prevents accidental coupling when one domain changes defaults. [src: bin/run-codex-mcp:L5-L10, rust/codex-mcp/src/config.rs:L194-L205]
+For deterministic behavior across environments, pin config in `config/cortex.toml` and keep MCP policy in the `[mcp]` section. This avoids drift between service-specific config files.
 
 Reference excerpt:
 

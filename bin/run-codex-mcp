@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_PATH="${CORTEX_MCP_CONFIG:-${CORTEX_CONFIG:-$HOME/.cortex/config.toml}}"
-BINARY_PATH="$PROJECT_ROOT/rust/codex-mcp/target/release/codex-mcp"
-
-if [[ ! -f "$CONFIG_PATH" ]]; then
-  mkdir -p "$(dirname "$CONFIG_PATH")"
-  cp "$PROJECT_ROOT/config/cortex.toml" "$CONFIG_PATH"
-fi
-
-if [[ ! -x "$BINARY_PATH" ]]; then
-  echo "codex-mcp binary not found at $BINARY_PATH"
-  echo "build it with: $PROJECT_ROOT/bin/build-rust-codex-mcp"
-  exit 1
-fi
-
-exec "$BINARY_PATH" --config "$CONFIG_PATH" "$@"
+echo "error: run-codex-mcp has been removed in the cortexctl migration." >&2
+echo "use: bin/cortexctl run mcp" >&2
+exit 64

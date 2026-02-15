@@ -14,13 +14,13 @@ The alternative was a lighter embedded database (for example SQLite-class storag
 
 ClickHouse provides three primitives Cortex relies on heavily: MergeTree write throughput, materialized view fanout, and SQL window/aggregation capabilities. These map directly to ingest workloads and retrieval design: the system can append aggressively, derive view-based ordering deterministically, and maintain sparse indexes incrementally in storage. [src: sql/001_schema.sql:L17, sql/002_views.sql:L73, sql/004_search_index.sql:L100]
 
-The cost is a heavier runtime than embedded alternatives and a larger schema/engine tuning surface. The mitigation is strict locality: loopback binding, local path templating, and shell-first lifecycle scripts that make runtime behavior transparent. [src: config/clickhouse.xml:L17, bin/start-clickhouse:L13, bin/start-clickhouse:L22]
+The cost is a heavier runtime than embedded alternatives and a larger schema/engine tuning surface. The mitigation is strict locality: loopback binding, local path templating, and a single Rust lifecycle surface (`cortexctl`) that keeps runtime behavior transparent.
 
 Revisit trigger: if operating envelope shifts to extremely constrained devices where ClickHouse memory/CPU profile becomes unacceptable, revisit this decision with measured workload traces rather than intuition.
 
 ## ADR-002: Rust-Only Ingestion Runtime
 
-Ingestion is implemented as a Rust async service and legacy Python ingestion paths were removed from operational flow. The reason is not language preference; it is control over concurrency, backpressure, and predictable behavior under sustained append load. [src: rust/ingestor/src/main.rs:L28, bin/run-ingestor-rust-service:L28]
+Ingestion is implemented as a Rust async service and legacy Python ingestion paths were removed from operational flow. The reason is not language preference; it is control over concurrency, backpressure, and predictable behavior under sustained append load.
 
 The most important benefit is explicit control of pressure points. Worker concurrency is semaphore-limited, dispatch queues are bounded, sink channels are bounded, and retry behavior is explicit. In an interpreter-based ad hoc pipeline, these limits are often implicit or unevenly enforced, which leads to intermittent stalls and memory spikes at higher event rates. [src: rust/ingestor/src/ingestor.rs:L60, rust/ingestor/src/ingestor.rs:L62, rust/ingestor/src/ingestor.rs:L74]
 

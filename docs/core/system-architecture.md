@@ -2,7 +2,7 @@
 
 ## System Objective
 
-Cortex converts append-heavy JSONL streams from `~/.codex/sessions/**/*.jsonl` and `~/.claude/projects/**/*.jsonl` into a local, queryable corpus that supports both rapid operational inspection and faithful trace reconstruction. This is a single-node operational index, not a distributed analytics system: [ClickHouse](https://github.com/ClickHouse/ClickHouse) binds to loopback, state is rooted under `~/.cortex`, and lifecycle is managed by local scripts or launchd. [src: config/ingestor.toml:L21-L33, config/clickhouse.xml:L10, config/clickhouse.xml:L17, bin/start-clickhouse:L5]
+Cortex converts append-heavy JSONL streams from `~/.codex/sessions/**/*.jsonl` and `~/.claude/projects/**/*.jsonl` into a local, queryable corpus that supports both rapid operational inspection and faithful trace reconstruction. This is a single-node operational index, not a distributed analytics system: [ClickHouse](https://github.com/ClickHouse/ClickHouse) binds to loopback, state is rooted under `~/.cortex`, and lifecycle is managed through `cortexctl`.
 
 The design prioritizes low append-to-visibility latency, replay fidelity across evolving record formats, and a thin retrieval process that relies on write-time index maintenance. These priorities drive the ingestion/runtime and schema choices documented below. [src: rust/ingestor/src/ingestor.rs:L45, rust/ingestor/src/normalize.rs:L336, sql/004_search_index.sql:L28, rust/codex-mcp/src/main.rs:L337]
 
@@ -10,13 +10,13 @@ The design prioritizes low append-to-visibility latency, replay fidelity across 
 
 The system is composed of four layers with explicit ownership boundaries.
 
-The storage layer is a local ClickHouse instance configured from templated XML and started via daemon mode or launchd. It owns canonical tables, reconstruction views, sparse lexical indexes, and query/hit logs; services interact through SQL only. [src: bin/start-clickhouse:L15, sql/001_schema.sql:L3, sql/002_views.sql:L61, sql/004_search_index.sql:L1]
+The storage layer is a local ClickHouse instance configured from templated XML and started by `cortexctl up`. It owns canonical tables, reconstruction views, sparse lexical indexes, and query/hit logs; services interact through SQL only.
 
 The ingestion layer is Rust `cortex-ingestor`: watcher plus reconcile scheduling, normalization, batching, checkpoint persistence, and heartbeat emission. It is the only transformation boundary from raw JSON to canonical classes. [src: rust/ingestor/src/ingestor.rs:L187, rust/ingestor/src/ingestor.rs:L284, rust/ingestor/src/ingestor.rs:L390, rust/ingestor/src/normalize.rs:L336]
 
 Indexing is implemented with ClickHouse materialized views that incrementally maintain `search_documents`, `search_postings`, and stats tables as canonical rows land. This shifts cost from corpus scans to sparse term lookups. [src: sql/004_search_index.sql:L28, sql/004_search_index.sql:L100, sql/004_search_index.sql:L154, sql/004_search_index.sql:L170]
 
-The retrieval layer is `codex-mcp`, a stdio JSON-RPC server exposing `search` and `open`. It performs BM25 scoring over prebuilt postings and returns prose or full JSON output without owning index-state lifecycle. [src: rust/codex-mcp/src/main.rs:L264, rust/codex-mcp/src/main.rs:L311, rust/codex-mcp/src/main.rs:L716, rust/codex-mcp/src/main.rs:L812]
+The retrieval layer is `cortex-mcp`, a stdio JSON-RPC server exposing `search` and `open`. It performs BM25 scoring over prebuilt postings and returns prose or full JSON output without owning index-state lifecycle.
 
 ## End-to-End Causal Flow
 
@@ -70,4 +70,4 @@ An exactly-once ingest guarantee was rejected because file-based append streams 
 
 Operators should treat schema and normalization as contracts. Changes to event classification, tokenization, or checkpoint semantics have cross-layer effects that can silently degrade retrieval or recovery behavior if not reviewed together.
 
-For day-to-day operation, health should be interpreted as a chain, not a single ping. A healthy chain includes ClickHouse availability, progressing `raw_events` and `normalized_events` counts, and recent heartbeat timestamps with stable flush latency. A broken link anywhere in this chain predicts stale retrieval even when one service appears alive. [src: bin/status:L30, bin/status:L83, bin/status:L90, sql/003_ingest_heartbeats.sql:L11]
+For day-to-day operation, health should be interpreted as a chain, not a single ping. A healthy chain includes ClickHouse availability, progressing `raw_events` and canonical event counts, and recent heartbeat timestamps with stable flush latency. A broken link anywhere in this chain predicts stale retrieval even when one service appears alive. Use `bin/cortexctl status` as the primary health entrypoint.

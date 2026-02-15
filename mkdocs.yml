@@ -58,5 +58,7 @@ nav:
       - Agent Interface: mcp/agent-interface.md
   - Architecture:
       - Design Tradeoffs: architecture/design-tradeoffs.md
+      - Workspace Ownership: architecture/workspace-ownership.md
   - Operations:
       - Build and Operations: operations/build-and-operations.md
+      - Migration Guide: operations/migration-guide.md

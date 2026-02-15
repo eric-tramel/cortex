@@ -1,38 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CORTEX_HOME="${CORTEX_HOME:-$HOME/.cortex}"
-CH_ROOT="$CORTEX_HOME/clickhouse"
-
-if ! command -v clickhouse-server >/dev/null 2>&1; then
-  echo "clickhouse-server is not installed or not on PATH"
-  exit 1
-fi
-
-mkdir -p "$CH_ROOT/data" "$CH_ROOT/tmp" "$CH_ROOT/log" "$CH_ROOT/user_files" "$CH_ROOT/format_schemas"
-
-sed "s#__CORTEX_HOME__#$CORTEX_HOME#g" "$PROJECT_ROOT/config/clickhouse.xml" > "$CH_ROOT/config.xml"
-sed "s#__CORTEX_HOME__#$CORTEX_HOME#g" "$PROJECT_ROOT/config/users.xml" > "$CH_ROOT/users.xml"
-
-PID_FILE="$CH_ROOT/clickhouse.pid"
-if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  echo "clickhouse-server already running (pid $(cat "$PID_FILE"))"
-else
-  clickhouse-server --config-file "$CH_ROOT/config.xml" --daemon
-fi
-
-for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:8123/?query=SELECT%201" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 0.5
-done
-
-if ! curl -fsS "http://127.0.0.1:8123/?query=SELECT%201" >/dev/null 2>&1; then
-  echo "clickhouse-server failed to become healthy"
-  exit 1
-fi
-
-"$PROJECT_ROOT/bin/init-db" --config "$PROJECT_ROOT/config/ingestor.toml"
-echo "clickhouse started and schema initialized"
+echo "error: start-clickhouse has been removed in the cortexctl migration." >&2
+echo "use: bin/cortexctl up --no-ingest" >&2
+exit 64

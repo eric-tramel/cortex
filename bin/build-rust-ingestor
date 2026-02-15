@@ -2,13 +2,6 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CRATE_DIR="$PROJECT_ROOT/rust/ingestor"
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "cargo is not installed or not on PATH"
-  exit 1
-fi
-
-cargo build --manifest-path "$CRATE_DIR/Cargo.toml" --release
-
-echo "built: $CRATE_DIR/target/release/cortex-ingestor"
+cargo build --release --manifest-path "$PROJECT_ROOT/apps/cortex-ingest/Cargo.toml"
+echo "built: $PROJECT_ROOT/target/release/cortex-ingest"
