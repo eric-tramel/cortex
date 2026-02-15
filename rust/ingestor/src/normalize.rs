@@ -75,6 +75,34 @@ fn to_u8_bool(value: Option<&Value>) -> u8 {
     }
 }
 
+fn canonicalize_model(provider: &str, raw_model: &str) -> String {
+    let mut model = raw_model.trim().to_ascii_lowercase();
+    if model.is_empty() {
+        return String::new();
+    }
+
+    model = model.replace(' ', "-");
+
+    if provider == "codex" && model == "codex" {
+        return "gpt-5.3-codex-xhigh".to_string();
+    }
+
+    model
+}
+
+fn resolve_model_hint(event_rows: &[Value], provider: &str, fallback: &str) -> String {
+    for row in event_rows.iter().rev() {
+        if let Some(model) = row.get("model").and_then(Value::as_str) {
+            let normalized = canonicalize_model(provider, model);
+            if !normalized.is_empty() {
+                return normalized;
+            }
+        }
+    }
+
+    canonicalize_model(provider, fallback)
+}
+
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
 }
@@ -414,6 +442,7 @@ fn normalize_codex_event(
     ctx: &RecordContext<'_>,
     top_type: &str,
     base_uid: &str,
+    model_hint: &str,
 ) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
     let mut events = Vec::<Value>::new();
     let mut links = Vec::<Value>::new();
@@ -462,7 +491,7 @@ fn normalize_codex_event(
                 row.insert("request_id".to_string(), json!(turn_id.clone()));
                 row.insert("item_id".to_string(), json!(turn_id));
             }
-            let model = to_str(payload_obj.get("model"));
+            let model = canonicalize_model("codex", &to_str(payload_obj.get("model")));
             if !model.is_empty() {
                 row.insert("model".to_string(), json!(model));
             }
@@ -688,22 +717,21 @@ fn normalize_codex_event(
                 row.insert("op_status".to_string(), json!(status));
             }
             if payload_type == "token_count" {
-                let input_tokens =
-                    to_u32(payload_obj.get("info").and_then(|v| v.get("last_token_usage").and_then(
-                        |usage| usage.get("input_tokens"),
-                    )));
-                let output_tokens =
-                    to_u32(payload_obj.get("info").and_then(|v| v.get("last_token_usage").and_then(
-                        |usage| usage.get("output_tokens"),
-                    )));
-                let cache_read_tokens =
-                    to_u32(payload_obj.get("info").and_then(|v| v.get("last_token_usage").and_then(
-                        |usage| usage.get("cached_input_tokens"),
-                    )));
-                let cache_write_tokens =
-                    to_u32(payload_obj.get("info").and_then(|v| v.get("last_token_usage").and_then(
-                        |usage| usage.get("cache_creation_input_tokens"),
-                    )));
+                let usage = payload_obj
+                    .get("info")
+                    .and_then(|v| v.get("last_token_usage"));
+                let input_tokens = to_u32(usage.and_then(|v| v.get("input_tokens")));
+                let output_tokens = to_u32(usage.and_then(|v| v.get("output_tokens")));
+                let cache_read_tokens = to_u32(
+                    usage
+                        .and_then(|v| v.get("cached_input_tokens"))
+                        .or_else(|| usage.and_then(|v| v.get("cache_read_input_tokens"))),
+                );
+                let cache_write_tokens = to_u32(
+                    usage
+                        .and_then(|v| v.get("cache_creation_input_tokens"))
+                        .or_else(|| usage.and_then(|v| v.get("cache_write_input_tokens"))),
+                );
 
                 let model = to_str(
                     payload_obj
@@ -717,13 +745,13 @@ fn normalize_codex_event(
                         .and_then(|v| v.get("limit_id")),
                 );
                 let resolved_model = if !model.is_empty() {
-                    model.to_ascii_lowercase()
+                    canonicalize_model("codex", &model)
                 } else if !fallback_model.is_empty() {
-                    fallback_model
+                    canonicalize_model("codex", &fallback_model)
                 } else if !fallback_limit_id.is_empty() {
-                    fallback_limit_id
+                    canonicalize_model("codex", &fallback_limit_id)
                 } else {
-                    String::new()
+                    canonicalize_model("codex", model_hint)
                 };
 
                 row.insert("input_tokens".to_string(), json!(input_tokens));
@@ -935,6 +963,25 @@ fn normalize_codex_event(
         }
     }
 
+    let payload_model = canonicalize_model("codex", &to_str(payload_obj.get("model")));
+    let inherited_model = canonicalize_model("codex", model_hint);
+    for event in &mut events {
+        if let Some(row) = event.as_object_mut() {
+            let row_model = canonicalize_model("codex", &to_str(row.get("model")));
+            let resolved_model = if !row_model.is_empty() {
+                row_model
+            } else if !payload_model.is_empty() {
+                payload_model.clone()
+            } else {
+                inherited_model.clone()
+            };
+
+            if !resolved_model.is_empty() {
+                row.insert("model".to_string(), json!(resolved_model));
+            }
+        }
+    }
+
     let parent = to_str(record.get("parent_id"));
     if !events.is_empty() && !parent.is_empty() {
         if let Some(uid) = events[0].get("event_uid").and_then(|v| v.as_str()) {
@@ -965,7 +1012,7 @@ fn normalize_claude_event(
 
     let message = record.get("message").cloned().unwrap_or(Value::Null);
     let msg_role = to_str(message.get("role"));
-    let model = to_str(message.get("model"));
+    let model = canonicalize_model("claude", &to_str(message.get("model")));
 
     let usage = message.get("usage").cloned().unwrap_or(Value::Null);
     let input_tokens = to_u32(usage.get("input_tokens"));
@@ -1278,6 +1325,7 @@ pub fn normalize_record(
     source_line_no: u64,
     source_offset: u64,
     session_hint: &str,
+    model_hint: &str,
 ) -> NormalizedRecord {
     let record_ts = to_str(record.get("timestamp"));
     let event_ts = parse_event_ts(&record_ts);
@@ -1349,8 +1397,9 @@ pub fn normalize_record(
     let (event_rows, link_rows, tool_rows) = if provider == "claude" {
         normalize_claude_event(record, &ctx, &top_type, &base_uid)
     } else {
-        normalize_codex_event(record, &ctx, &top_type, &base_uid)
+        normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint)
     };
+    let model_hint = resolve_model_hint(&event_rows, provider, model_hint);
 
     NormalizedRecord {
         raw_row,
@@ -1358,6 +1407,7 @@ pub fn normalize_record(
         link_rows,
         tool_rows,
         session_hint: session_id,
+        model_hint,
     }
 }
 
@@ -1388,6 +1438,7 @@ mod tests {
             1,
             42,
             1024,
+            "",
             "",
         );
 
@@ -1421,6 +1472,7 @@ mod tests {
             1,
             1,
             1,
+            "",
             "",
         );
 
@@ -1469,6 +1521,7 @@ mod tests {
             2,
             2,
             "",
+            "",
         );
 
         let row = out.event_rows[0].as_object().unwrap();
@@ -1487,6 +1540,48 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn codex_token_count_alias_codex_maps_to_xhigh() {
+        let record = json!({
+            "timestamp": "2026-02-15T04:52:55.538Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 72636,
+                        "output_tokens": 285,
+                        "cached_input_tokens": 70784
+                    }
+                },
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "limit_name": null,
+                    "plan_type": "pro"
+                }
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/Users/eric/.codex/sessions/2026/02/15/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+            1,
+            1,
+            4,
+            4,
+            "",
+            "",
+        );
+
+        let row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(
+            row.get("model").unwrap().as_str().unwrap(),
+            "gpt-5.3-codex-xhigh"
         );
     }
 
@@ -1513,6 +1608,7 @@ mod tests {
             1,
             3,
             3,
+            "",
             "",
         );
 
@@ -1580,6 +1676,7 @@ mod tests {
             2,
             10,
             100,
+            "",
             "",
         );
 

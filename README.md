@@ -80,6 +80,28 @@ Config defaults to `~/.cortex/config.toml` (auto-seeded from `config/cortex.toml
 bin/run-codex-mcp --config /path/to/config.toml
 ```
 
+## Cortex Monitor UI (build + launch)
+The monitor is a Rust backend that serves the web UI and ClickHouse-backed APIs from one process.
+
+Build:
+```bash
+cd ~/src/cortex
+cargo build --manifest-path cortex-monitor/backend/Cargo.toml
+```
+
+Run:
+```bash
+cd ~/src/cortex
+cargo run --manifest-path cortex-monitor/backend/Cargo.toml -- \
+  --config config/cortex.toml \
+  --host 127.0.0.1 \
+  --port 8090
+```
+
+Then open `http://127.0.0.1:8090`.
+
+If `8090` is already in use, pick a different port (for example `8091`) and open that port in your browser.
+
 ## Search schema
 `bin/start-clickhouse` / `bin/init-db` now also applies `sql/004_search_index.sql`, which creates:
 - `cortex.search_documents`

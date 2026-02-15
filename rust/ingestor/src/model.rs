@@ -19,6 +19,7 @@ pub struct NormalizedRecord {
     pub link_rows: Vec<Value>,
     pub tool_rows: Vec<Value>,
     pub session_hint: String,
+    pub model_hint: String,
 }
 
 #[derive(Debug, Clone, Default)]

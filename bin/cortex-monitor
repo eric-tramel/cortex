@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CARGO_BIN="${CORTEX_MONITOR_CARGO:-cargo}"
+
+exec "$CARGO_BIN" run --manifest-path "$PROJECT_ROOT/cortex-monitor/backend/Cargo.toml" -- "$@"

@@ -1,0 +1,45 @@
+# Cortex Monitor
+
+Local UI to inspect the `cortex` ClickHouse database, now backed by a Rust server.
+
+## Run
+
+```bash
+cd /Users/eric/src/cortex
+bin/cortex-monitor --host 127.0.0.1 --port 8080
+```
+
+Open:
+
+```txt
+http://127.0.0.1:8080
+```
+
+Optional flags:
+
+- `--host` (default: `127.0.0.1`)
+- `--port` (default: `8080`)
+- `--config` path to `cortex.toml`-style config
+- `--static-dir` path to web assets (defaults to `cortex-monitor/web`)
+
+Environment helpers:
+
+- `CORTEX_CONFIG` to point at a config file (overridden by `--config`)
+- `CORTEX_MONITOR_CARGO` to override the `cargo` binary
+
+## API endpoints
+
+- `GET /api/health` – ClickHouse ping/version
+- `GET /api/status` – database and ingestor status summary
+- `GET /api/analytics?range=24h` – model analytics (token usage and turns by time bucket)
+- `GET /api/tables` – table list and estimated row counts
+- `GET /api/tables/:name?limit=25` – schema and sample rows
+
+Supported analytics ranges:
+
+- `15m`
+- `1h`
+- `6h`
+- `24h`
+- `7d`
+- `30d`

@@ -735,6 +735,7 @@ async fn process_file(
     let mut offset = checkpoint.last_offset;
     let mut line_no = checkpoint.last_line_no;
     let mut session_hint = String::new();
+    let mut model_hint = String::new();
 
     let mut batch = RowBatch::default();
 
@@ -805,9 +806,11 @@ async fn process_file(
             line_no,
             start_offset,
             &session_hint,
+            &model_hint,
         );
 
         session_hint = normalized.session_hint;
+        model_hint = normalized.model_hint;
         batch.raw_rows.push(normalized.raw_row);
         batch.event_rows.extend(normalized.event_rows);
         batch.link_rows.extend(normalized.link_rows);
