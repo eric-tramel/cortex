@@ -1,0 +1,25 @@
+[clickhouse]
+url = "http://127.0.0.1:8123"
+database = "cortex"
+username = "default"
+password = ""
+timeout_seconds = 30.0
+async_insert = true
+wait_for_async_insert = true
+
+[mcp]
+max_results = 25
+preview_chars = 320
+default_context_before = 3
+default_context_after = 3
+default_include_tool_events = false
+default_exclude_codex_mcp = true
+async_log_writes = false
+protocol_version = "2024-11-05"
+
+[bm25]
+k1 = 1.2
+b = 0.75
+default_min_score = 0.0
+default_min_should_match = 1
+max_query_terms = 32

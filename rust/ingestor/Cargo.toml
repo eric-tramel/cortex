@@ -1,0 +1,22 @@
+[package]
+name = "cortex-ingestor"
+version = "0.1.0"
+edition = "2021"
+description = "Event-driven Rust ingestor for Codex sessions into ClickHouse"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+glob = "0.3"
+notify = "7.0"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+urlencoding = "2.1"
+walkdir = "2.5"

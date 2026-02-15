@@ -1,0 +1,35 @@
+<clickhouse>
+  <profiles>
+    <default>
+      <max_threads>16</max_threads>
+      <max_memory_usage>0</max_memory_usage>
+      <load_balancing>random</load_balancing>
+    </default>
+  </profiles>
+
+  <users>
+    <default>
+      <password></password>
+      <profile>default</profile>
+      <quota>default</quota>
+      <networks>
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+      </networks>
+      <access_management>1</access_management>
+    </default>
+  </users>
+
+  <quotas>
+    <default>
+      <interval>
+        <duration>3600</duration>
+        <queries>0</queries>
+        <errors>0</errors>
+        <result_rows>0</result_rows>
+        <read_rows>0</read_rows>
+        <execution_time>0</execution_time>
+      </interval>
+    </default>
+  </quotas>
+</clickhouse>

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_PATH="${CORTEX_MCP_CONFIG:-$PROJECT_ROOT/config/codex-mcp.toml}"
+BINARY_PATH="$PROJECT_ROOT/rust/codex-mcp/target/release/codex-mcp"
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  CONFIG_PATH="$PROJECT_ROOT/config/ingestor.toml"
+fi
+
+if [[ ! -x "$BINARY_PATH" ]]; then
+  echo "codex-mcp binary not found at $BINARY_PATH"
+  echo "build it with: $PROJECT_ROOT/bin/build-rust-codex-mcp"
+  exit 1
+fi
+
+exec "$BINARY_PATH" --config "$CONFIG_PATH" "$@"

@@ -1,0 +1,20 @@
+[clickhouse]
+url = "http://127.0.0.1:8123"
+database = "cortex"
+username = "default"
+password = ""
+timeout_seconds = 30.0
+async_insert = true
+wait_for_async_insert = true
+
+[ingest]
+sessions_glob = "~/.codex/sessions/**/*.jsonl"
+batch_size = 4000
+flush_interval_seconds = 0.5
+state_dir = "~/.cortex/ingestor"
+backfill_on_start = true
+max_file_workers = 8
+max_inflight_batches = 64
+debounce_ms = 50
+reconcile_interval_seconds = 30.0
+heartbeat_interval_seconds = 5.0

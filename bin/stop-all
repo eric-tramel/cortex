@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CORTEX_HOME="${CORTEX_HOME:-$HOME/.cortex}"
+
+INGEST_PID_FILE="$CORTEX_HOME/ingestor/ingestor.pid"
+CH_PID_FILE="$CORTEX_HOME/clickhouse/clickhouse.pid"
+
+if [[ -f "$INGEST_PID_FILE" ]]; then
+  INGEST_PID="$(cat "$INGEST_PID_FILE")"
+  if kill -0 "$INGEST_PID" 2>/dev/null; then
+    kill "$INGEST_PID"
+    echo "stopped ingestor ($INGEST_PID)"
+  fi
+  rm -f "$INGEST_PID_FILE"
+fi
+
+if [[ -f "$CH_PID_FILE" ]]; then
+  CH_PID="$(cat "$CH_PID_FILE")"
+  if kill -0 "$CH_PID" 2>/dev/null; then
+    kill "$CH_PID"
+    echo "stopped clickhouse ($CH_PID)"
+  fi
+  rm -f "$CH_PID_FILE"
+fi

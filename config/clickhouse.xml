@@ -1,0 +1,45 @@
+<clickhouse>
+  <logger>
+    <level>information</level>
+    <log>__CORTEX_HOME__/clickhouse/log/clickhouse-server.log</log>
+    <errorlog>__CORTEX_HOME__/clickhouse/log/clickhouse-server.err.log</errorlog>
+    <size>1000M</size>
+    <count>3</count>
+  </logger>
+
+  <path>__CORTEX_HOME__/clickhouse/data/</path>
+  <tmp_path>__CORTEX_HOME__/clickhouse/tmp/</tmp_path>
+  <user_files_path>__CORTEX_HOME__/clickhouse/user_files/</user_files_path>
+  <format_schema_path>__CORTEX_HOME__/clickhouse/format_schemas/</format_schema_path>
+  <users_config>__CORTEX_HOME__/clickhouse/users.xml</users_config>
+  <pid>__CORTEX_HOME__/clickhouse/clickhouse.pid</pid>
+
+  <listen_host>127.0.0.1</listen_host>
+  <http_port>8123</http_port>
+  <tcp_port>9000</tcp_port>
+  <interserver_http_port>9009</interserver_http_port>
+
+  <max_connections>2048</max_connections>
+  <max_concurrent_queries>500</max_concurrent_queries>
+  <uncompressed_cache_size>536870912</uncompressed_cache_size>
+  <mark_cache_size>536870912</mark_cache_size>
+
+  <query_log>
+    <database>system</database>
+    <table>query_log</table>
+    <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+  </query_log>
+
+  <metric_log>
+    <database>system</database>
+    <table>metric_log</table>
+    <collect_interval_milliseconds>1000</collect_interval_milliseconds>
+    <flush_interval_milliseconds>7000</flush_interval_milliseconds>
+  </metric_log>
+
+  <asynchronous_metric_log>
+    <database>system</database>
+    <table>asynchronous_metric_log</table>
+    <flush_interval_milliseconds>7000</flush_interval_milliseconds>
+  </asynchronous_metric_log>
+</clickhouse>

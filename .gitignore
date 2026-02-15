@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+
+# Rust
+target/
+
+# Local/editor/OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Build and generated output
+*.log
+site/
+docs/.quality/review-report.json
+docs/_source/

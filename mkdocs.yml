@@ -1,0 +1,62 @@
+site_name: Cortex Documentation
+site_description: Local ClickHouse + Rust ingestion + BM25 indexing architecture and operations
+site_url: http://127.0.0.1:8000
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  palette:
+    scheme: slate
+    primary: blue grey
+    accent: cyan
+  features:
+    - navigation.sections
+    - navigation.expand
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+
+plugins:
+  - search
+
+hooks:
+  - scripts/mkdocs_hooks.py
+
+extra_css:
+  - https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/styles/github-dark.min.css
+  - stylesheets/citation-pills.css
+  - stylesheets/source-links.css
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/highlight.min.js
+  - javascripts/source-viewer.js
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: README.md
+  - Cortex Core:
+      - System Architecture: core/system-architecture.md
+      - Data Model: core/data-model.md
+      - Ingestion Service: core/ingestion-service.md
+  - Cortex Search:
+      - Retrieval and BM25: search/indexing-and-retrieval.md
+  - Cortex MCP:
+      - Agent Interface: mcp/agent-interface.md
+  - Architecture:
+      - Design Tradeoffs: architecture/design-tradeoffs.md
+  - Operations:
+      - Build and Operations: operations/build-and-operations.md

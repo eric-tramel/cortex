@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_PATH="$PROJECT_ROOT/config/ingestor.toml"
+BINARY_PATH="$PROJECT_ROOT/rust/ingestor/target/release/cortex-ingestor"
+
+for _ in $(seq 1 180); do
+  if curl -fsS "http://127.0.0.1:8123/?query=SELECT%201" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! curl -fsS "http://127.0.0.1:8123/?query=SELECT%201" >/dev/null 2>&1; then
+  echo "clickhouse is unavailable; ingestor exiting"
+  exit 1
+fi
+
+"$PROJECT_ROOT/bin/init-db" --config "$CONFIG_PATH"
+
+if [[ ! -x "$BINARY_PATH" ]]; then
+  echo "rust ingestor binary not found at $BINARY_PATH"
+  echo "build it with: $PROJECT_ROOT/bin/build-rust-ingestor"
+  exit 1
+fi
+
+exec "$BINARY_PATH" --config "$CONFIG_PATH"
