@@ -3,8 +3,7 @@ import argparse
 import json
 import select
 import subprocess
-import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 def read_json_line(proc: subprocess.Popen[str], timeout_seconds: int = 20) -> Dict[str, Any]:
@@ -50,7 +49,46 @@ def assert_tool_success(result: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def run_smoke(cortexctl: str, config: str, query: str) -> None:
+def select_hit(
+    hits: list[Any],
+    expect_session_id: Optional[str],
+    expect_source_file: Optional[str],
+) -> Dict[str, Any]:
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        if expect_session_id is not None and hit.get("session_id") != expect_session_id:
+            continue
+        if expect_source_file is not None:
+            source_ref = hit.get("source_ref")
+            if not isinstance(source_ref, str) or expect_source_file not in source_ref:
+                continue
+        return hit
+
+    debug_hits = [
+        {
+            "event_uid": hit.get("event_uid"),
+            "session_id": hit.get("session_id"),
+            "source_ref": hit.get("source_ref"),
+        }
+        for hit in hits
+        if isinstance(hit, dict)
+    ][:5]
+    raise AssertionError(
+        "search did not return a hit matching expected filters: "
+        f"session_id={expect_session_id}, source_file={expect_source_file}, "
+        f"hits={debug_hits}"
+    )
+
+
+def run_smoke(
+    cortexctl: str,
+    config: str,
+    query: str,
+    expect_session_id: Optional[str],
+    expect_source_file: Optional[str],
+    expect_open_text: Optional[str],
+) -> None:
     proc = subprocess.Popen(
         [cortexctl, "run", "mcp", "--config", config],
         stdin=subprocess.PIPE,
@@ -103,7 +141,7 @@ def run_smoke(cortexctl: str, config: str, query: str) -> None:
                     "arguments": {
                         "query": query,
                         "verbosity": "full",
-                        "limit": 5,
+                        "limit": 20,
                         "exclude_codex_mcp": False,
                     },
                 },
@@ -118,12 +156,10 @@ def run_smoke(cortexctl: str, config: str, query: str) -> None:
         if not isinstance(hits, list) or not hits:
             raise AssertionError(f"search returned no hits for query={query}")
 
-        first_hit = hits[0]
-        if not isinstance(first_hit, dict):
-            raise AssertionError("search first hit is not an object")
-        event_uid = first_hit.get("event_uid")
+        selected_hit = select_hit(hits, expect_session_id, expect_source_file)
+        event_uid = selected_hit.get("event_uid")
         if not isinstance(event_uid, str) or not event_uid:
-            raise AssertionError("search first hit missing event_uid")
+            raise AssertionError("selected search hit missing event_uid")
 
         open_resp = send_request(
             proc,
@@ -144,6 +180,12 @@ def run_smoke(cortexctl: str, config: str, query: str) -> None:
         open_payload = open_result.get("structuredContent")
         if not isinstance(open_payload, dict):
             raise AssertionError("open structuredContent missing")
+        if open_payload.get("found") is not True:
+            raise AssertionError(f"open did not find event_uid={event_uid}: {open_payload}")
+        if expect_session_id is not None and open_payload.get("session_id") != expect_session_id:
+            raise AssertionError(
+                f"open session mismatch: got={open_payload.get('session_id')} want={expect_session_id}"
+            )
 
         events = open_payload.get("events")
         if not isinstance(events, list) or not events:
@@ -153,6 +195,24 @@ def run_smoke(cortexctl: str, config: str, query: str) -> None:
             isinstance(event, dict) and event.get("event_uid") == event_uid for event in events
         ):
             raise AssertionError("open response did not include requested event_uid")
+        if expect_source_file is not None and not any(
+            isinstance(event, dict)
+            and isinstance(event.get("source_ref"), str)
+            and expect_source_file in event.get("source_ref", "")
+            for event in events
+        ):
+            raise AssertionError(
+                f"open response did not include expected source file: {expect_source_file}"
+            )
+        if expect_open_text is not None and not any(
+            isinstance(event, dict)
+            and isinstance(event.get("text_content"), str)
+            and expect_open_text in event.get("text_content", "")
+            for event in events
+        ):
+            raise AssertionError(
+                f"open response did not include expected text marker: {expect_open_text}"
+            )
     finally:
         if proc.stdin:
             proc.stdin.close()
@@ -169,13 +229,22 @@ def main() -> int:
     parser.add_argument("--cortexctl", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--query", required=True)
+    parser.add_argument("--expect-session-id")
+    parser.add_argument("--expect-source-file")
+    parser.add_argument("--expect-open-text")
     args = parser.parse_args()
 
-    run_smoke(args.cortexctl, args.config, args.query)
+    run_smoke(
+        args.cortexctl,
+        args.config,
+        args.query,
+        args.expect_session_id,
+        args.expect_source_file,
+        args.expect_open_text,
+    )
     print("mcp smoke passed")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
