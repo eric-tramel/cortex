@@ -33,3 +33,31 @@ maintenance/run_multiagent_repo_audit.sh --dry-run
 - `maintenance/REPORT.md`: deduplicated findings.
 - `maintenance/ISSUES_CREATED.md`: one line per issue-creation result.
 - run artifacts in `/tmp/cortex-maintenance-<timestamp>` (or `--run-dir`).
+
+## Issue Worker Orchestrator
+
+`run_issue_worker.sh` runs one issue-focused automation cycle:
+
+1. Accept a comma-separated label union (`--tag-union`).
+2. Select the highest priority matching open issue (`P0 > P1 > P2 > unlabeled`, then lowest issue number).
+3. Mark it in progress with `status/in-progress`.
+4. Create a fresh worktree/branch for that issue.
+5. Launch `codex exec` with `gpt-5.3-codex` + `xhigh` effort to fix, test, commit, push, and open a PR.
+
+Quick start:
+
+```bash
+maintenance/run_issue_worker.sh --tag-union "area/config,area/security"
+```
+
+Dry run (select only, no claim or Codex launch):
+
+```bash
+maintenance/run_issue_worker.sh --tag-union "area/config,area/security" --dry-run
+```
+
+Main outputs:
+
+- No run artifacts are retained.
+- The script uses a temporary run directory under `/tmp` and removes it on exit.
+- Durable state is kept in GitHub issue/PR updates only.
