@@ -288,8 +288,37 @@ fn load_cfg(raw_config: Option<PathBuf>) -> Result<(PathBuf, AppConfig)> {
     Ok((config_path, cfg))
 }
 
+fn clickhouse_ports_from_url(cfg: &AppConfig) -> Result<(u16, u16, u16)> {
+    let parsed = reqwest::Url::parse(&cfg.clickhouse.url)
+        .with_context(|| format!("invalid clickhouse.url '{}'", cfg.clickhouse.url))?;
+    let http_port = parsed.port_or_known_default().ok_or_else(|| {
+        anyhow!(
+            "clickhouse.url '{}' must include a known port",
+            cfg.clickhouse.url
+        )
+    })?;
+    let tcp_port = http_port
+        .checked_add(877)
+        .ok_or_else(|| anyhow!("derived clickhouse tcp port overflow from {}", http_port))?;
+    let interserver_http_port = http_port.checked_add(886).ok_or_else(|| {
+        anyhow!(
+            "derived clickhouse interserver port overflow from {}",
+            http_port
+        )
+    })?;
+    Ok((http_port, tcp_port, interserver_http_port))
+}
+
 fn materialize_clickhouse_config(cfg: &AppConfig, paths: &RuntimePaths) -> Result<()> {
-    let rendered_clickhouse = CLICKHOUSE_TEMPLATE.replace("__CORTEX_HOME__", &cfg.runtime.root_dir);
+    let (http_port, tcp_port, interserver_http_port) = clickhouse_ports_from_url(cfg)?;
+    let rendered_clickhouse = CLICKHOUSE_TEMPLATE
+        .replace("__CORTEX_HOME__", &cfg.runtime.root_dir)
+        .replace("__CLICKHOUSE_HTTP_PORT__", &http_port.to_string())
+        .replace("__CLICKHOUSE_TCP_PORT__", &tcp_port.to_string())
+        .replace(
+            "__CLICKHOUSE_INTERSERVER_HTTP_PORT__",
+            &interserver_http_port.to_string(),
+        );
     let rendered_users = USERS_TEMPLATE.replace("__CORTEX_HOME__", &cfg.runtime.root_dir);
 
     fs::write(&paths.clickhouse_config, rendered_clickhouse).with_context(|| {
@@ -2104,6 +2133,22 @@ mod tests {
             parse_clickhouse_install_flags(&args, DEFAULT_CLICKHOUSE_TAG).expect("parse flags");
         assert!(force);
         assert_eq!(version, "v25.12.5.44-stable");
+    }
+
+    #[test]
+    fn clickhouse_ports_follow_url_port() {
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = "http://127.0.0.1:18123".to_string();
+        let ports = clickhouse_ports_from_url(&cfg).expect("ports");
+        assert_eq!(ports, (18123, 19000, 19009));
+    }
+
+    #[test]
+    fn clickhouse_ports_require_valid_url() {
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = "not-a-url".to_string();
+        let err = clickhouse_ports_from_url(&cfg).expect_err("invalid url");
+        assert!(err.to_string().contains("invalid clickhouse.url"));
     }
 
     #[test]
