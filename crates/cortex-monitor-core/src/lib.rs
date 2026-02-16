@@ -84,6 +84,23 @@ fn json_response<T: Serialize>(payload: T, status: StatusCode) -> Response {
     response
 }
 
+fn clickhouse_ping_payload(version: String, ping_result: Result<()>, ping_ms: f64) -> Value {
+    match ping_result {
+        Ok(()) => json!({
+            "healthy": true,
+            "version": version,
+            "ping_ms": ping_ms,
+            "error": Value::Null,
+        }),
+        Err(error) => json!({
+            "healthy": false,
+            "version": version,
+            "ping_ms": ping_ms,
+            "error": error.to_string(),
+        }),
+    }
+}
+
 async fn api_health(State(state): State<AppState>) -> Response {
     let start = Instant::now();
     let connection_stats = query_clickhouse_connections(&state)
@@ -170,13 +187,9 @@ async fn api_status(State(state): State<AppState>) -> Response {
         match state.clickhouse.version().await {
             Ok(version) => {
                 let start = Instant::now();
-                let _ = state.clickhouse.ping().await;
-                json!({
-                    "healthy": true,
-                    "version": version,
-                    "ping_ms": (Instant::elapsed(&start).as_secs_f64() * 1000.0),
-                    "error": Value::Null,
-                })
+                let ping_result = state.clickhouse.ping().await;
+                let ping_ms = Instant::elapsed(&start).as_secs_f64() * 1000.0;
+                clickhouse_ping_payload(version, ping_result, ping_ms)
             }
             Err(error) => {
                 json!({
@@ -966,6 +979,7 @@ fn value_to_i64(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn identifier_safety_helper() {
@@ -979,5 +993,24 @@ mod tests {
     fn escaping_helpers() {
         assert_eq!(escape_literal("a'b"), "a''b");
         assert_eq!(escape_identifier("ev`ents"), "`ev``ents`");
+    }
+
+    #[test]
+    fn clickhouse_ping_payload_marks_healthy_when_ping_succeeds() {
+        let payload = clickhouse_ping_payload("24.8".to_string(), Ok(()), 3.5);
+        assert_eq!(payload["healthy"], json!(true));
+        assert_eq!(payload["version"], json!("24.8"));
+        assert_eq!(payload["ping_ms"], json!(3.5));
+        assert_eq!(payload["error"], Value::Null);
+    }
+
+    #[test]
+    fn clickhouse_ping_payload_marks_unhealthy_when_ping_fails() {
+        let payload =
+            clickhouse_ping_payload("24.8".to_string(), Err(anyhow!("ping failed")), 8.25);
+        assert_eq!(payload["healthy"], json!(false));
+        assert_eq!(payload["version"], json!("24.8"));
+        assert_eq!(payload["ping_ms"], json!(8.25));
+        assert_eq!(payload["error"], json!("ping failed"));
     }
 }
