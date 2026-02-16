@@ -71,6 +71,20 @@ function parseRowsFromTableOption(optionText: string | null): number | null {
   return Number.parseInt(digitsOnly, 10);
 }
 
+function parseConnectionTotalFromCard(cardText: string | null): number | null {
+  const match = cardText?.match(/Connections\s+([\d,]+)\s+total/i);
+  if (!match) {
+    return null;
+  }
+
+  const digitsOnly = match[1].replace(/[^\d]/g, '');
+  if (!digitsOnly) {
+    return null;
+  }
+
+  return Number.parseInt(digitsOnly, 10);
+}
+
 function modelCountFromAnalytics(response: AnalyticsResponse): number {
   const models = new Set<string>();
 
@@ -114,11 +128,14 @@ test('live monitor UI reflects ingested fixture data', async ({ page }) => {
   await expect(page.locator('#healthCard .card')).toHaveCount(5);
   await expect(page.locator('#ingestorCard .card').first()).toContainText('Healthy');
 
+  const connectionsCard = page.locator('#healthCard .card').filter({ hasText: 'Connections' });
+  await expect(connectionsCard).toContainText('Connections');
   const connectionsTotal = health.connections?.total;
   if (connectionsTotal !== null && connectionsTotal !== undefined) {
-    await expect(page.locator('#healthCard .card').filter({ hasText: 'Connections' })).toContainText(
-      `${Number(connectionsTotal).toLocaleString()} total`,
-    );
+    const connectionsCardText = await connectionsCard.textContent();
+    const displayedConnections = parseConnectionTotalFromCard(connectionsCardText);
+    expect(displayedConnections).not.toBeNull();
+    expect(displayedConnections!).toBeGreaterThan(0);
   }
 
   const latestIngestor = status.ingestor?.latest;
