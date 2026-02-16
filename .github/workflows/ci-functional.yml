@@ -33,6 +33,11 @@ jobs:
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Verify Bun
+        run: bun --version
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
