@@ -31,6 +31,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
