@@ -10,7 +10,7 @@
     "typecheck": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test --config playwright.config.cjs"
   },
   "dependencies": {
     "chart.js": "^4.5.1"
