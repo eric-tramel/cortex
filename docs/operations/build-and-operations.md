@@ -23,7 +23,7 @@ This produces binaries for:
 ### Cargo install
 
 ```bash
-git clone <repo-url> ~/src/cortex
+git clone https://github.com/eric-tramel/cortex.git ~/src/cortex
 cd ~/src/cortex
 cargo install --path apps/cortexctl --locked
 ```
@@ -31,7 +31,7 @@ cargo install --path apps/cortexctl --locked
 Or install directly from GitHub without cloning:
 
 ```bash
-cargo install --git https://github.com/<owner>/<repo>.git \
+cargo install --git https://github.com/eric-tramel/cortex.git \
   --package cortexctl \
   --bin cortexctl \
   --locked
@@ -40,13 +40,20 @@ cargo install --git https://github.com/<owner>/<repo>.git \
 ### Prebuilt release binary
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install-cortexctl.sh \
-  | bash -s -- --repo <owner>/<repo>
+curl -fsSL https://raw.githubusercontent.com/eric-tramel/cortex/main/scripts/install-cortexctl.sh \
+  | bash -s -- --repo eric-tramel/cortex
 ```
 
-Default install location is `~/.local/bin/cortexctl`.
+Default binary symlink location is `~/.local/bin`. Versioned bundles are installed under `~/.local/lib/cortex/<tag>/<target>` with `~/.local/lib/cortex/current` as active symlink.
 
-`cortexctl` manages ClickHouse process lifecycle, but it expects `clickhouse-server` to already be installed. The install script checks this and prints remediation guidance when missing.
+The installer fetches a full bundle (`cortexctl`, `cortex-ingest`, `cortex-monitor`, `cortex-mcp`) and installs managed ClickHouse automatically by default.
+
+Install paths:
+
+- Bundle root: `~/.local/lib/cortex/<tag>/<target>`
+- Active symlink: `~/.local/lib/cortex/current`
+- Command symlinks: `~/.local/bin`
+- Managed ClickHouse root: `~/.local/lib/cortex/clickhouse/current`
 
 ## Publish prebuilt binaries
 
@@ -55,9 +62,12 @@ Tag-driven GitHub Actions release workflow:
 1. Push a semantic tag (example: `v0.1.0`).
 2. Workflow `.github/workflows/release-cortexctl.yml` builds:
    - `x86_64-unknown-linux-gnu`
+   - `aarch64-unknown-linux-gnu`
    - `x86_64-apple-darwin`
    - `aarch64-apple-darwin`
-3. Uploads `cortexctl-<target>.tar.gz` plus `cortexctl-<target>.sha256` to the tag release.
+3. Uploads `cortex-bundle-<target>.tar.gz` plus `cortex-bundle-<target>.sha256` to the tag release.
+
+Each bundle includes `manifest.json` with target/version metadata, per-binary checksums, and build metadata.
 
 ## Config model
 
@@ -84,6 +94,10 @@ bin/cortexctl up
 3. Applies versioned migrations through `cortex-clickhouse` (`schema_migrations` ledger).
 4. Starts ingest and optional services from `runtime` config.
 
+It auto-installs managed ClickHouse when missing and `runtime.clickhouse_auto_install=true`.
+
+`cortexctl clickhouse status` reports managed install state, active binary source (`managed` vs `PATH`), installed version, and checksum state.
+
 ## DB lifecycle
 
 ```bash
@@ -106,7 +120,21 @@ cd ~/src/cortex
 bin/cortexctl run ingest
 bin/cortexctl run monitor --host 127.0.0.1 --port 8090
 bin/cortexctl run mcp
+bin/cortexctl run clickhouse
 ```
+
+## Boot services
+
+```bash
+cd ~/src/cortex
+bin/cortexctl service install
+bin/cortexctl service status
+bin/cortexctl service uninstall
+```
+
+- macOS: installs user LaunchAgents under `~/Library/LaunchAgents`.
+- Linux: installs user systemd units under `~/.config/systemd/user`.
+- Linux linger is checked during install. If linger is unavailable, Cortex prints the exact remediation command (`sudo loginctl enable-linger <user>`).
 
 ## Status, logs, shutdown
 
