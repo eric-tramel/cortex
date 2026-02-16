@@ -319,13 +319,19 @@ EOF
   wait_for_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}/api/health" 120
   (
     cd "$repo_root/web/monitor"
-    PLAYWRIGHT_BROWSERS_PATH="$playwright_browsers_path" \
-      MONITOR_BASE_URL="http://127.0.0.1:${monitor_port}" \
-      CORTEX_E2E_CODEX_KEYWORD="$codex_keyword" \
-      CORTEX_E2E_CLAUDE_KEYWORD="$claude_keyword" \
-      CORTEX_E2E_CODEX_TRACE_MARKER="$codex_trace_marker" \
-      CORTEX_E2E_CLAUDE_TRACE_MARKER="$claude_trace_marker" \
+    export PLAYWRIGHT_BROWSERS_PATH="$playwright_browsers_path"
+    export MONITOR_BASE_URL="http://127.0.0.1:${monitor_port}"
+    export CORTEX_E2E_CODEX_KEYWORD="$codex_keyword"
+    export CORTEX_E2E_CLAUDE_KEYWORD="$claude_keyword"
+    export CORTEX_E2E_CODEX_TRACE_MARKER="$codex_trace_marker"
+    export CORTEX_E2E_CLAUDE_TRACE_MARKER="$claude_trace_marker"
+
+    # Bun 1.3.9 on macOS arm64 can mis-handle Playwright CLI args in CI.
+    if command -v node >/dev/null 2>&1 && [[ -f "node_modules/playwright/cli.js" ]]; then
+      node node_modules/playwright/cli.js test --config playwright.config.cjs e2e/monitor.live.spec.ts
+    else
       bun run test:e2e -- e2e/monitor.live.spec.ts
+    fi
   )
 
   echo "[e2e] checking MCP initialize/tools/search/open (codex)"
