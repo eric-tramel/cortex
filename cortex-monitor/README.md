@@ -2,11 +2,13 @@
 
 Local UI to inspect the `cortex` ClickHouse database, now backed by a Rust server.
 
+Note: `cortex-monitor/backend` is a legacy reference-only tree. Authoritative monitor runtime code is in `apps/cortex-monitor` and `crates/cortex-monitor-core`.
+
 ## Run
 
 ```bash
 cd /Users/eric/src/cortex
-bin/cortex-monitor --host 127.0.0.1 --port 8080
+bin/cortexctl run monitor -- --host 127.0.0.1 --port 8080
 ```
 
 Open:
@@ -25,7 +27,7 @@ Optional flags:
 Environment helpers:
 
 - `CORTEX_CONFIG` to point at a config file (overridden by `--config`)
-- `CORTEX_MONITOR_CARGO` to override the `cargo` binary
+- `CORTEX_SOURCE_TREE_MODE=1` to opt into source-tree binary fallback when running from a checkout
 
 ## Frontend build
 

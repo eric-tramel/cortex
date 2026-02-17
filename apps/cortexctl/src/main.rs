@@ -77,6 +77,7 @@ enum CliCommand {
     Db(DbArgs),
     Clickhouse(ClickhouseArgs),
     Service(ServiceArgs),
+    Config(ConfigArgs),
     Run(RunArgs),
 }
 
@@ -158,6 +159,23 @@ struct ServiceUninstallArgs {
     disable: bool,
     #[arg(long)]
     stop: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    Get(ConfigGetArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigGetArgs {
+    #[arg(value_name = "KEY")]
+    key: String,
 }
 
 #[derive(Debug, Args)]
@@ -2286,6 +2304,17 @@ fn cmd_clickhouse_uninstall(paths: &RuntimePaths) -> Result<String> {
     Ok(paths.managed_clickhouse_dir.display().to_string())
 }
 
+fn cmd_config_get(cfg: &AppConfig, key: &str) -> Result<String> {
+    match key {
+        "clickhouse.url" => Ok(cfg.clickhouse.url.clone()),
+        "clickhouse.database" => Ok(cfg.clickhouse.database.clone()),
+        _ => bail!(
+            "unsupported config key '{}'; supported keys: clickhouse.url, clickhouse.database",
+            key
+        ),
+    }
+}
+
 fn health_label(value: bool) -> &'static str {
     if value {
         "healthy"
@@ -2856,6 +2885,26 @@ async fn main() -> Result<ExitCode> {
                 }
             }
         }
+        CliCommand::Config(args) => {
+            let (_, cfg) = load_cfg(cli.config.clone())?;
+            match args.command {
+                ConfigCommand::Get(get) => {
+                    let value = cmd_config_get(&cfg, &get.key)?;
+                    if output.is_json() {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "key": get.key,
+                                "value": value,
+                            }))?
+                        );
+                    } else {
+                        println!("{value}");
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
         CliCommand::Run(run) => {
             let (inline_config, passthrough) = parse_config_flag(&run.args)?;
             let raw_config = inline_config.or(cli.config.clone());
@@ -2943,6 +2992,17 @@ mod tests {
     }
 
     #[test]
+    fn clap_parses_config_get_key() {
+        let cli = Cli::parse_from(["cortexctl", "config", "get", "clickhouse.url"]);
+        match cli.command {
+            CliCommand::Config(ConfigArgs {
+                command: ConfigCommand::Get(get),
+            }) => assert_eq!(get.key, "clickhouse.url"),
+            _ => panic!("expected config get command"),
+        }
+    }
+
+    #[test]
     fn clap_parses_run_passthrough_args() {
         let cli = Cli::parse_from([
             "cortexctl",
@@ -2969,6 +3029,29 @@ mod tests {
             }
             _ => panic!("expected run command"),
         }
+    }
+
+    #[test]
+    fn cmd_config_get_returns_supported_keys() {
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = "http://127.0.0.1:18123".to_string();
+        cfg.clickhouse.database = "analytics".to_string();
+
+        assert_eq!(
+            cmd_config_get(&cfg, "clickhouse.url").expect("url"),
+            "http://127.0.0.1:18123"
+        );
+        assert_eq!(
+            cmd_config_get(&cfg, "clickhouse.database").expect("database"),
+            "analytics"
+        );
+    }
+
+    #[test]
+    fn cmd_config_get_rejects_unknown_key() {
+        let cfg = AppConfig::default();
+        let err = cmd_config_get(&cfg, "runtime.root_dir").expect_err("unknown key");
+        assert!(err.to_string().contains("unsupported config key"));
     }
 
     #[test]
