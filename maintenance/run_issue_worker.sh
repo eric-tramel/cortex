@@ -13,8 +13,8 @@ Select one highest-priority open GitHub issue, claim it as in-progress, spawn
 one or more fresh worktrees, and launch Codex execution(s) to implement/fix and
 open PR(s).
 
-If --tag-union is provided, selection is filtered to issues matching that label
-union; otherwise selection considers all open issues.
+If --tag-union is provided, selection is filtered to unblocked issues matching
+that label union; otherwise selection considers all unblocked open issues.
 
 Options:
   --tag-union "a,b,c"         Optional. Comma-separated label union.
@@ -116,7 +116,7 @@ prepare_tag_filter() {
     fi
   done
 
-  TAG_FILTER_DESC="all open issues (no tag filter)"
+  TAG_FILTER_DESC="all unblocked open issues (no tag filter)"
   if [ -n "$TAG_UNION" ] && [ "${#TAGS[@]}" -eq 0 ]; then
     die "--tag-union was provided but did not contain any valid labels"
   fi
@@ -140,12 +140,74 @@ ensure_status_label_exists() {
   fi
 }
 
+fetch_open_issues_with_dependencies() {
+  local run_dir="$1"
+  local cursor="null"
+  local has_next="true"
+  local fetched=0
+  local page_size=0
+  local page_count=0
+  local fetched_this_page=0
+
+  : > "$run_dir/issues_pages.jsonl"
+
+  while [ "$fetched" -lt "$ISSUE_LIMIT" ] && [ "$has_next" = "true" ]; do
+    page_size=$((ISSUE_LIMIT - fetched))
+    if [ "$page_size" -gt 100 ]; then
+      page_size=100
+    fi
+
+    gh api graphql \
+      -f query='query($owner:String!,$name:String!,$limit:Int!,$cursor:String){ repository(owner:$owner,name:$name){ issues(first:$limit, states:OPEN, orderBy:{field:CREATED_AT,direction:ASC}, after:$cursor){ nodes { number title url updatedAt labels(first:50){nodes{name}} issueDependenciesSummary { blockedBy } } pageInfo { hasNextPage endCursor } } } }' \
+      -F owner="$REPO_OWNER" \
+      -F name="$REPO_NAME" \
+      -F limit="$page_size" \
+      -F cursor="$cursor" > "$run_dir/issues_page_${page_count}.json"
+
+    jq -c '.data.repository.issues.nodes[]' "$run_dir/issues_page_${page_count}.json" >> "$run_dir/issues_pages.jsonl"
+    fetched_this_page="$(jq '.data.repository.issues.nodes | length' "$run_dir/issues_page_${page_count}.json")"
+    fetched=$((fetched + fetched_this_page))
+    has_next="$(jq -r '.data.repository.issues.pageInfo.hasNextPage' "$run_dir/issues_page_${page_count}.json")"
+    cursor="$(jq -r '.data.repository.issues.pageInfo.endCursor // "null"' "$run_dir/issues_page_${page_count}.json")"
+    page_count=$((page_count + 1))
+
+    if [ "$fetched_this_page" -eq 0 ] || [ "$has_next" != "true" ] || [ "$cursor" = "null" ]; then
+      break
+    fi
+  done
+
+  if [ -s "$run_dir/issues_pages.jsonl" ]; then
+    jq -s '
+      map({
+        number,
+        title,
+        url,
+        updatedAt,
+        blockedByCount: (.issueDependenciesSummary.blockedBy // 0),
+        labels: (.labels.nodes | map(.name))
+      })
+    ' "$run_dir/issues_pages.jsonl" > "$run_dir/issues_raw.json"
+  else
+    printf '[]\n' > "$run_dir/issues_raw.json"
+  fi
+}
+
+issue_blocked_by_count() {
+  local issue_number="$1"
+
+  gh api graphql \
+    -f query='query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ issue(number:$number){ issueDependenciesSummary { blockedBy } } } }' \
+    -F owner="$REPO_OWNER" \
+    -F name="$REPO_NAME" \
+    -F number="$issue_number" \
+    --jq '.data.repository.issue.issueDependenciesSummary.blockedBy // 0'
+}
+
 select_issue_candidate() {
   local run_dir="$1"
 
-  log "Fetching open issues from $REPO..."
-  gh issue list --repo "$REPO" --state open --limit "$ISSUE_LIMIT" \
-    --json number,title,url,labels,updatedAt > "$run_dir/issues_raw.json"
+  log "Fetching open issues from $REPO with dependency metadata..."
+  fetch_open_issues_with_dependencies "$run_dir"
 
   jq --arg status_label "$STATUS_LABEL" --argjson tags "$TAGS_JSON" '
     map({
@@ -153,7 +215,8 @@ select_issue_candidate() {
       title,
       url,
       updatedAt,
-      labels: (.labels | map(.name))
+      blockedByCount,
+      labels
     })
     | map(.matches_union = (
         if ($tags | length) == 0 then true
@@ -162,6 +225,7 @@ select_issue_candidate() {
       ))
     | map(select(.matches_union))
     | map(select((.labels | index($status_label)) | not))
+    | map(select((.blockedByCount // 0) == 0))
     | map(.priority_rank = (
         if (.labels | index("P0")) then 0
         elif (.labels | index("P1")) then 1
@@ -222,6 +286,15 @@ run_issue_cycle() {
   if jq -e --arg status "$STATUS_LABEL" '.labels | map(.name) | index($status) != null' \
     "$RUN_DIR/issue_preclaim.json" >/dev/null; then
     fail_run "preclaim_check" "Issue #$ISSUE_NUMBER was claimed concurrently before locking."
+  fi
+  if ! BLOCKED_BY_COUNT="$(issue_blocked_by_count "$ISSUE_NUMBER")"; then
+    fail_run "preclaim_check" "Failed to verify dependency state for issue #$ISSUE_NUMBER."
+  fi
+  if ! [[ "$BLOCKED_BY_COUNT" =~ ^[0-9]+$ ]]; then
+    fail_run "preclaim_check" "Unexpected blocked-by count '$BLOCKED_BY_COUNT' for issue #$ISSUE_NUMBER."
+  fi
+  if [ "$BLOCKED_BY_COUNT" -gt 0 ]; then
+    fail_run "preclaim_check" "Issue #$ISSUE_NUMBER is currently blocked by $BLOCKED_BY_COUNT issue(s)."
   fi
 
   log "Claiming issue #$ISSUE_NUMBER with '$STATUS_LABEL'..."
@@ -401,9 +474,9 @@ run_dry_run_selection() {
     rm -rf "$dry_run_dir"
     if [ "$select_status" -eq "$NO_ISSUES_EXIT_CODE" ]; then
       if [ "${#TAGS[@]}" -gt 0 ]; then
-        die "No matching open issues found for union: $TAG_FILTER_DESC"
+        die "No matching unblocked open issues found for union: $TAG_FILTER_DESC"
       fi
-      die "No open issues available outside '$STATUS_LABEL'."
+      die "No unblocked open issues available outside '$STATUS_LABEL'."
     fi
     die "Failed selecting issue candidates."
   fi
@@ -640,6 +713,11 @@ if ! gh auth status >/dev/null 2>&1; then
 fi
 
 REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+REPO_OWNER="${REPO%%/*}"
+REPO_NAME="${REPO#*/}"
+[ -n "$REPO_OWNER" ] || die "Unable to parse repository owner from '$REPO'."
+[ -n "$REPO_NAME" ] || die "Unable to parse repository name from '$REPO'."
+[ "$REPO_OWNER" != "$REPO_NAME" ] || die "Expected owner/name format for repo, got '$REPO'."
 ORCH_RUN_ID="$(date -u +'%Y%m%dT%H%M%SZ')-$$"
 ORCH_RUN_DIR="$(mktemp -d "/tmp/cortex-issue-worker-orch-${ORCH_RUN_ID}.XXXXXX")"
 trap main_cleanup EXIT
