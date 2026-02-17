@@ -2,9 +2,9 @@
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "install-launchd is macOS-only; on Linux use: bin/cortexctl service install" >&2
+  echo "install-launchd is macOS-only; on Linux use: bin/moraine service install" >&2
   exit 64
 fi
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec "$PROJECT_ROOT/bin/cortexctl" service install "$@"
+exec "$PROJECT_ROOT/bin/moraine" service install "$@"

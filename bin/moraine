@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CARGO_BIN="${MORAINE_CTL_CARGO:-cargo}"
+CRATE_MANIFEST="$PROJECT_ROOT/apps/moraine/Cargo.toml"
+BIN_PATH="$PROJECT_ROOT/target/debug/moraine"
+
+if [[ "${MORAINE_CTL_USE_CARGO_RUN:-0}" == "1" ]]; then
+  exec "$CARGO_BIN" run --manifest-path "$CRATE_MANIFEST" -- "$@"
+fi
+
+if [[ ! -x "$BIN_PATH" || "${MORAINE_CTL_FORCE_BUILD:-0}" == "1" ]]; then
+  "$CARGO_BIN" build --manifest-path "$CRATE_MANIFEST"
+fi
+
+exec "$BIN_PATH" "$@"
