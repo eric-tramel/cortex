@@ -6,12 +6,99 @@ CARGO_BIN="${MORAINE_CTL_CARGO:-cargo}"
 CRATE_MANIFEST="$PROJECT_ROOT/apps/moraine/Cargo.toml"
 BIN_PATH="$PROJECT_ROOT/target/debug/moraine"
 
+build_if_missing() {
+  local package_name="$1"
+  local manifest_path="$2"
+  local bin_path="$PROJECT_ROOT/target/debug/$package_name"
+
+  if [[ ! -x "$bin_path" ]]; then
+    "$CARGO_BIN" build --manifest-path "$manifest_path"
+  fi
+}
+
+first_non_flag_arg() {
+  local skip_next=0
+  for arg in "$@"; do
+    if [[ "$skip_next" == "1" ]]; then
+      skip_next=0
+      continue
+    fi
+    case "$arg" in
+      --config|--output)
+        skip_next=1
+        ;;
+      --config=*|--output=*|--verbose|--help|-h|--version)
+        ;;
+      -*)
+        ;;
+      *)
+        printf '%s\n' "$arg"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+run_service_arg() {
+  local saw_run=0
+  local skip_next=0
+  for arg in "$@"; do
+    if [[ "$skip_next" == "1" ]]; then
+      skip_next=0
+      continue
+    fi
+    case "$arg" in
+      --config|--output)
+        skip_next=1
+        continue
+        ;;
+      --config=*|--output=*|--verbose|--help|-h|--version)
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+    esac
+
+    if [[ "$saw_run" == "1" ]]; then
+      printf '%s\n' "$arg"
+      return 0
+    fi
+
+    if [[ "$arg" == "run" ]]; then
+      saw_run=1
+    fi
+  done
+  return 1
+}
+
 if [[ "${MORAINE_CTL_USE_CARGO_RUN:-0}" == "1" ]]; then
   exec "$CARGO_BIN" run --manifest-path "$CRATE_MANIFEST" -- "$@"
 fi
 
 if [[ ! -x "$BIN_PATH" || "${MORAINE_CTL_FORCE_BUILD:-0}" == "1" ]]; then
   "$CARGO_BIN" build --manifest-path "$CRATE_MANIFEST"
+fi
+
+# Running through the source-tree wrapper should "just work" for sibling binaries.
+: "${MORAINE_SOURCE_TREE_MODE:=1}"
+export MORAINE_SOURCE_TREE_MODE
+
+command_name="$(first_non_flag_arg "$@" || true)"
+if [[ "$command_name" == "run" ]]; then
+  service_name="$(run_service_arg "$@" || true)"
+  case "$service_name" in
+    ingest)
+      build_if_missing "moraine-ingest" "$PROJECT_ROOT/apps/moraine-ingest/Cargo.toml"
+      ;;
+    monitor)
+      build_if_missing "moraine-monitor" "$PROJECT_ROOT/apps/moraine-monitor/Cargo.toml"
+      ;;
+    mcp)
+      build_if_missing "moraine-mcp" "$PROJECT_ROOT/apps/moraine-mcp/Cargo.toml"
+      ;;
+  esac
 fi
 
 exec "$BIN_PATH" "$@"
