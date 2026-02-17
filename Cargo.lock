@@ -337,6 +337,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortex-conversations"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "cortex-clickhouse",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cortex-ingest"
 version = "0.1.1"
 dependencies = [
@@ -385,12 +402,11 @@ dependencies = [
  "anyhow",
  "cortex-clickhouse",
  "cortex-config",
- "regex",
+ "cortex-conversations",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]
