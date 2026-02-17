@@ -36,6 +36,7 @@ Notes:
 
 - Moraine stores state under `~/.moraine`.
 - If ClickHouse is missing, `moraine up` auto-installs a managed ClickHouse build by default.
+- Moraine does not install launchd/systemd login startup entries.
 
 ## Where Data Comes From
 
@@ -63,7 +64,6 @@ For host integration details and the tool contract (`search`, `open`), see `docs
 - `moraine status`: health + ingest heartbeat
 - `moraine logs`: service logs
 - `moraine down`: stop everything
-- `moraine service install`: start services on login (macOS `launchd`, Linux user `systemd`)
 
 ## Configuration (Optional)
 

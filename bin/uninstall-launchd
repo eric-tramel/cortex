@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "uninstall-launchd is macOS-only; on Linux use: bin/moraine service uninstall" >&2
-  exit 64
-fi
-
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec "$PROJECT_ROOT/bin/moraine" service uninstall "$@"
+echo "uninstall-launchd has been removed. Moraine no longer installs launchd/systemd startup entries." >&2
+echo "If you still have legacy entries, remove them with launchctl and delete matching plist files." >&2
+exit 64

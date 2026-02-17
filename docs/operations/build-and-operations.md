@@ -133,16 +133,7 @@ bin/moraine run clickhouse
 
 ## Boot services
 
-```bash
-cd ~/src/moraine
-bin/moraine service install
-bin/moraine service status
-bin/moraine service uninstall
-```
-
-- macOS: installs user LaunchAgents under `~/Library/LaunchAgents`.
-- Linux: installs user systemd units under `~/.config/systemd/user`.
-- Linux linger is checked during install. If linger is unavailable, Moraine prints the exact remediation command (`sudo loginctl enable-linger <user>`).
+Moraine no longer installs launchd/systemd login startup entries.
 
 ## Status, logs, shutdown
 
@@ -172,11 +163,13 @@ Legacy lifecycle aliases remain as fail-fast migration stubs with a `moraine` re
 - `bin/status`
 - `bin/stop-all`
 
-Legacy service wrappers are retired (no longer shipped):
+Legacy service wrappers remain only as fail-fast stubs:
 
 - `bin/start-ingestor` -> `bin/moraine up`
 - `bin/run-codex-mcp` -> `bin/moraine run mcp`
 - `bin/moraine-monitor` -> `bin/moraine run monitor`
+- `bin/install-launchd` -> removed (startup install no longer supported)
+- `bin/uninstall-launchd` -> removed (startup install no longer supported)
 
 ## Failure triage
 
