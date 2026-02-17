@@ -204,6 +204,99 @@ fn parse_event_ts(record_ts: &str) -> String {
     Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
+fn event_kind_in_domain(value: &str) -> bool {
+    matches!(
+        value,
+        "session_meta"
+            | "turn_context"
+            | "message"
+            | "tool_call"
+            | "tool_result"
+            | "reasoning"
+            | "event_msg"
+            | "compacted_raw"
+            | "progress"
+            | "system"
+            | "summary"
+            | "queue_operation"
+            | "file_history_snapshot"
+            | "unknown"
+    )
+}
+
+fn payload_type_in_domain(value: &str) -> bool {
+    matches!(
+        value,
+        "session_meta"
+            | "turn_context"
+            | "message"
+            | "function_call"
+            | "function_call_output"
+            | "custom_tool_call"
+            | "custom_tool_call_output"
+            | "web_search_call"
+            | "reasoning"
+            | "response_item"
+            | "event_msg"
+            | "user_message"
+            | "agent_message"
+            | "agent_reasoning"
+            | "token_count"
+            | "task_started"
+            | "task_complete"
+            | "turn_aborted"
+            | "item_completed"
+            | "search_results_received"
+            | "compacted"
+            | "thinking"
+            | "tool_use"
+            | "tool_result"
+            | "text"
+            | "progress"
+            | "system"
+            | "summary"
+            | "queue-operation"
+            | "file-history-snapshot"
+            | "unknown"
+    )
+}
+
+fn link_type_in_domain(value: &str) -> bool {
+    matches!(
+        value,
+        "parent_event"
+            | "compacted_parent"
+            | "parent_uuid"
+            | "tool_use_id"
+            | "source_tool_assistant"
+            | "unknown"
+    )
+}
+
+fn canonicalize_event_kind(value: &str) -> &str {
+    if event_kind_in_domain(value) {
+        value
+    } else {
+        "unknown"
+    }
+}
+
+fn canonicalize_payload_type(value: &str) -> &str {
+    if payload_type_in_domain(value) {
+        value
+    } else {
+        "unknown"
+    }
+}
+
+fn canonicalize_link_type(value: &str) -> &str {
+    if link_type_in_domain(value) {
+        value
+    } else {
+        "unknown"
+    }
+}
+
 fn event_uid(
     source_file: &str,
     source_generation: u32,
@@ -266,6 +359,8 @@ fn base_event_obj(
     payload_json: &str,
 ) -> Map<String, Value> {
     let text_content = truncate_chars(text_content, TEXT_LIMIT);
+    let event_kind = canonicalize_event_kind(event_kind);
+    let payload_type = canonicalize_payload_type(payload_type);
     let mut obj = Map::<String, Value>::new();
     obj.insert(
         "event_uid".to_string(),
@@ -386,6 +481,7 @@ fn build_link_row(
     link_type: &str,
     metadata_json: &str,
 ) -> Value {
+    let link_type = canonicalize_link_type(link_type);
     json!({
         "event_uid": event_uid,
         "linked_event_uid": linked_event_uid,
@@ -1417,7 +1513,7 @@ pub fn normalize_record(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_record;
+    use super::{build_link_row, normalize_record, RecordContext};
     use serde_json::json;
 
     #[test]
@@ -1698,5 +1794,133 @@ mod tests {
             "tool_call"
         );
         assert_eq!(first.get("provider").unwrap().as_str().unwrap(), "claude");
+    }
+
+    #[test]
+    fn codex_unknown_payload_type_is_canonicalized() {
+        let record = json!({
+            "timestamp": "2026-02-15T03:50:50.838Z",
+            "type": "response_item",
+            "payload": {
+                "type": "brand_new_payload_type",
+                "body": "x"
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/Users/eric/.codex/sessions/2026/02/15/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+            1,
+            1,
+            5,
+            5,
+            "",
+            "",
+        );
+
+        let row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(row.get("event_kind").unwrap().as_str().unwrap(), "unknown");
+        assert_eq!(
+            row.get("payload_type").unwrap().as_str().unwrap(),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn codex_event_msg_known_operational_payload_type_is_preserved() {
+        let record = json!({
+            "timestamp": "2026-02-15T03:50:50.838Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "status": "in_progress"
+            }
+        });
+
+        let out = normalize_record(
+            &record,
+            "codex",
+            "codex",
+            "/Users/eric/.codex/sessions/2026/02/15/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+            1,
+            1,
+            6,
+            6,
+            "",
+            "",
+        );
+
+        let row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(
+            row.get("event_kind").unwrap().as_str().unwrap(),
+            "event_msg"
+        );
+        assert_eq!(
+            row.get("payload_type").unwrap().as_str().unwrap(),
+            "task_started"
+        );
+    }
+
+    #[test]
+    fn claude_progress_unknown_payload_type_moves_to_unknown_and_preserves_op_kind() {
+        let record = json!({
+            "timestamp": "2026-02-15T03:50:50.838Z",
+            "type": "progress",
+            "sessionId": "7c666c01-d38e-4658-8650-854ffb5b626e",
+            "data": {
+                "type": "provider_extension_step"
+            },
+            "status": "ok"
+        });
+
+        let out = normalize_record(
+            &record,
+            "claude",
+            "claude",
+            "/Users/eric/.claude/projects/p1/s1.jsonl",
+            1,
+            1,
+            6,
+            6,
+            "",
+            "",
+        );
+
+        let row = out.event_rows[0].as_object().unwrap();
+        assert_eq!(row.get("event_kind").unwrap().as_str().unwrap(), "progress");
+        assert_eq!(
+            row.get("payload_type").unwrap().as_str().unwrap(),
+            "unknown"
+        );
+        assert_eq!(
+            row.get("op_kind").unwrap().as_str().unwrap(),
+            "provider_extension_step"
+        );
+    }
+
+    #[test]
+    fn link_type_is_canonicalized_to_domain() {
+        let ctx = RecordContext {
+            source_name: "codex",
+            provider: "codex",
+            session_id: "s1",
+            session_date: "2026-02-15",
+            source_file: "/tmp/s1.jsonl",
+            source_inode: 1,
+            source_generation: 1,
+            source_line_no: 1,
+            source_offset: 1,
+            record_ts: "2026-02-15T03:50:50.838Z",
+            event_ts: "2026-02-15 03:50:50.838",
+        };
+
+        let link = build_link_row(&ctx, "e1", "e2", "new_link_type", "{}");
+        let link_obj = link.as_object().unwrap();
+        assert_eq!(
+            link_obj.get("link_type").unwrap().as_str().unwrap(),
+            "unknown"
+        );
     }
 }

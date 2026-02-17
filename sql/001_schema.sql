@@ -70,7 +70,20 @@ CREATE TABLE IF NOT EXISTS cortex.events (
   text_preview String,
   payload_json String,
   token_usage_json String,
-  event_version UInt64
+  event_version UInt64,
+  CONSTRAINT events_event_kind_domain CHECK event_kind IN (
+    'session_meta', 'turn_context', 'message', 'tool_call', 'tool_result', 'reasoning',
+    'event_msg', 'compacted_raw', 'progress', 'system', 'summary', 'queue_operation',
+    'file_history_snapshot', 'unknown'
+  ),
+  CONSTRAINT events_payload_type_domain CHECK payload_type IN (
+    'session_meta', 'turn_context', 'message', 'function_call', 'function_call_output',
+    'custom_tool_call', 'custom_tool_call_output', 'web_search_call', 'reasoning',
+    'response_item', 'event_msg', 'user_message', 'agent_message', 'agent_reasoning',
+    'token_count', 'task_started', 'task_complete', 'turn_aborted', 'item_completed',
+    'search_results_received', 'compacted', 'thinking', 'tool_use', 'tool_result', 'text',
+    'progress', 'system', 'summary', 'queue-operation', 'file-history-snapshot', 'unknown'
+  )
 )
 ENGINE = ReplacingMergeTree(event_version)
 PARTITION BY toYYYYMM(ingested_at)
@@ -85,7 +98,11 @@ CREATE TABLE IF NOT EXISTS cortex.event_links (
   provider LowCardinality(String),
   source_name LowCardinality(String),
   metadata_json String,
-  event_version UInt64
+  event_version UInt64,
+  CONSTRAINT event_links_link_type_domain CHECK link_type IN (
+    'parent_event', 'compacted_parent', 'parent_uuid', 'tool_use_id', 'source_tool_assistant',
+    'unknown'
+  )
 )
 ENGINE = ReplacingMergeTree(event_version)
 PARTITION BY toYYYYMM(ingested_at)
