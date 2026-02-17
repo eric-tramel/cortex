@@ -1,4 +1,5 @@
 use crate::model::NormalizedRecord;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde_json::{json, Map, Value};
@@ -73,6 +74,32 @@ fn to_u8_bool(value: Option<&Value>) -> u8 {
             }
         }
         _ => 0,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    Codex,
+    Claude,
+}
+
+impl Provider {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "codex" => Ok(Self::Codex),
+            "claude" => Ok(Self::Claude),
+            _ => Err(anyhow!(
+                "unsupported provider `{}`; expected one of: codex, claude",
+                raw.trim()
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
     }
 }
 
@@ -1336,12 +1363,14 @@ pub fn normalize_record(
     source_offset: u64,
     session_hint: &str,
     model_hint: &str,
-) -> NormalizedRecord {
+) -> Result<NormalizedRecord> {
+    let provider = Provider::parse(provider)?;
+    let provider_name = provider.as_str();
     let record_ts = to_str(record.get("timestamp"));
     let (event_ts, event_ts_parse_failed) = parse_event_ts(&record_ts);
     let top_type = to_str(record.get("type"));
 
-    let mut session_id = if provider == "claude" {
+    let mut session_id = if provider == Provider::Claude {
         to_str(record.get("sessionId"))
     } else {
         String::new()
@@ -1354,7 +1383,7 @@ pub fn normalize_record(
         };
     }
 
-    if provider == "codex" && top_type == "session_meta" {
+    if provider == Provider::Codex && top_type == "session_meta" {
         let payload = record.get("payload").cloned().unwrap_or(Value::Null);
         let payload_id = to_str(payload.get("id"));
         if !payload_id.is_empty() {
@@ -1376,7 +1405,7 @@ pub fn normalize_record(
 
     let raw_row = json!({
         "source_name": source_name,
-        "provider": provider,
+        "provider": provider_name,
         "source_file": source_file,
         "source_inode": source_inode,
         "source_generation": source_generation,
@@ -1411,7 +1440,7 @@ pub fn normalize_record(
 
     let ctx = RecordContext {
         source_name,
-        provider,
+        provider: provider_name,
         session_id: &session_id,
         session_date: &session_date,
         source_file,
@@ -1423,14 +1452,14 @@ pub fn normalize_record(
         event_ts: &event_ts,
     };
 
-    let (event_rows, link_rows, tool_rows) = if provider == "claude" {
+    let (event_rows, link_rows, tool_rows) = if provider == Provider::Claude {
         normalize_claude_event(record, &ctx, &top_type, &base_uid)
     } else {
         normalize_codex_event(record, &ctx, &top_type, &base_uid, model_hint)
     };
-    let model_hint = resolve_model_hint(&event_rows, provider, model_hint);
+    let model_hint = resolve_model_hint(&event_rows, provider_name, model_hint);
 
-    NormalizedRecord {
+    Ok(NormalizedRecord {
         raw_row,
         event_rows,
         link_rows,
@@ -1438,7 +1467,7 @@ pub fn normalize_record(
         error_rows,
         session_hint: session_id,
         model_hint,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1470,7 +1499,8 @@ mod tests {
             1024,
             "",
             "",
-        );
+        )
+        .expect("codex tool call should normalize");
 
         assert_eq!(out.event_rows.len(), 1);
         assert_eq!(out.tool_rows.len(), 1);
@@ -1505,7 +1535,8 @@ mod tests {
             1,
             "",
             "",
-        );
+        )
+        .expect("codex turn context should normalize");
 
         let row = out.event_rows[0].as_object().unwrap();
         assert_eq!(
@@ -1556,7 +1587,8 @@ mod tests {
             2,
             "",
             "",
-        );
+        )
+        .expect("codex token count should normalize");
 
         let row = out.event_rows[0].as_object().unwrap();
         assert_eq!(
@@ -1615,7 +1647,8 @@ mod tests {
             4,
             "",
             "",
-        );
+        )
+        .expect("codex token count alias should normalize");
 
         let row = out.event_rows[0].as_object().unwrap();
         assert_eq!(
@@ -1649,7 +1682,8 @@ mod tests {
             3,
             "",
             "",
-        );
+        )
+        .expect("codex custom tool call should normalize");
 
         assert_eq!(out.event_rows.len(), 1);
         assert_eq!(out.tool_rows.len(), 1);
@@ -1714,7 +1748,8 @@ mod tests {
             100,
             "",
             "",
-        );
+        )
+        .expect("claude event should normalize");
 
         assert_eq!(out.event_rows.len(), 2);
         assert_eq!(out.tool_rows.len(), 1);
@@ -1812,5 +1847,32 @@ mod tests {
             "2026-02-16"
         );
         assert_eq!(out.error_rows.len(), 1);
+    }
+
+    #[test]
+    fn unknown_provider_is_rejected() {
+        let record = json!({
+            "timestamp": "2026-02-15T03:50:42.191Z",
+            "type": "turn_context",
+        });
+
+        let err = normalize_record(
+            &record,
+            "unknown",
+            "unknown",
+            "/tmp/sessions/session-1.jsonl",
+            1,
+            1,
+            1,
+            1,
+            "",
+            "",
+        )
+        .expect_err("unknown provider should be rejected");
+
+        assert!(
+            err.to_string().contains("unsupported provider"),
+            "unexpected error: {err:#}"
+        );
     }
 }
