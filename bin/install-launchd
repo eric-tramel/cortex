@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "install-launchd has been removed. Moraine no longer installs launchd/systemd startup entries." >&2
-echo "Use 'bin/moraine up' to start services for the current session." >&2
-exit 64

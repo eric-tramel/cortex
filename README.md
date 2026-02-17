@@ -36,7 +36,6 @@ Notes:
 
 - Moraine stores state under `~/.moraine`.
 - If ClickHouse is missing, `moraine up` auto-installs a managed ClickHouse build by default.
-- Moraine does not install launchd/systemd login startup entries.
 
 ## Where Data Comes From
 

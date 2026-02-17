@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "uninstall-launchd has been removed. Moraine no longer installs launchd/systemd startup entries." >&2
-echo "If you still have legacy entries, remove them with launchctl and delete matching plist files." >&2
-exit 64

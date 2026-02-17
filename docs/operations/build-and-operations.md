@@ -131,10 +131,6 @@ bin/moraine run mcp
 bin/moraine run clickhouse
 ```
 
-## Boot services
-
-Moraine no longer installs launchd/systemd login startup entries.
-
 ## Status, logs, shutdown
 
 ```bash
@@ -163,13 +159,11 @@ Legacy lifecycle aliases remain as fail-fast migration stubs with a `moraine` re
 - `bin/status`
 - `bin/stop-all`
 
-Legacy service wrappers remain only as fail-fast stubs:
+Legacy wrappers remain only as fail-fast stubs:
 
 - `bin/start-ingestor` -> `bin/moraine up`
 - `bin/run-codex-mcp` -> `bin/moraine run mcp`
 - `bin/moraine-monitor` -> `bin/moraine run monitor`
-- `bin/install-launchd` -> removed (startup install no longer supported)
-- `bin/uninstall-launchd` -> removed (startup install no longer supported)
 
 ## Failure triage
 
