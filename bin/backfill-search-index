@@ -3,23 +3,55 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_PATH="${CORTEX_CONFIG:-$HOME/.cortex/config.toml}"
+WRITE_CONFIG=0
+
+usage() {
+  cat <<EOF
+usage: $(basename "$0") [--config <path>] [--write-config]
+
+options:
+  --config <path>   config file path (default: CORTEX_CONFIG or ~/.cortex/config.toml)
+  --write-config    explicitly allow writing a missing config by copying config/cortex.toml
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config)
+      if [[ $# -lt 2 ]]; then
+        echo "--config requires a value" >&2
+        exit 2
+      fi
       CONFIG_PATH="$2"
       shift 2
       ;;
+    --write-config)
+      WRITE_CONFIG=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
     *)
       echo "unknown argument: $1" >&2
+      usage >&2
       exit 2
       ;;
   esac
 done
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
-  mkdir -p "$(dirname "$CONFIG_PATH")"
-  cp "$PROJECT_ROOT/config/cortex.toml" "$CONFIG_PATH"
+  if [[ "$WRITE_CONFIG" -eq 1 ]]; then
+    mkdir -p "$(dirname "$CONFIG_PATH")"
+    cp "$PROJECT_ROOT/config/cortex.toml" "$CONFIG_PATH"
+    echo "wrote default config to $CONFIG_PATH"
+  else
+    echo "config not found: $CONFIG_PATH" >&2
+    echo "refusing to write config without explicit opt-in" >&2
+    echo "rerun with --write-config to copy $PROJECT_ROOT/config/cortex.toml" >&2
+    exit 1
+  fi
 fi
 
 config_get() {
