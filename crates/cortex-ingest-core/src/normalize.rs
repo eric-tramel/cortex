@@ -1955,7 +1955,8 @@ mod tests {
             101,
             "",
             "",
-        );
+        )
+        .expect("claude assistant record should normalize");
 
         assert_eq!(out.link_rows.len(), 3);
 
@@ -2053,7 +2054,8 @@ mod tests {
             12,
             "",
             "",
-        );
+        )
+        .expect("compacted record should normalize");
 
         let compacted_uid = out.event_rows[0]
             .get("event_uid")
