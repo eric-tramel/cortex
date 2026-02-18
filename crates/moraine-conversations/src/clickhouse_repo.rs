@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use ahash::AHashMap as HashMap;
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use moraine_clickhouse::ClickHouseClient;
@@ -131,6 +131,20 @@ struct CachedPostingRow {
     term: String,
     event_uid: String,
     session_id: String,
+    is_message_like: u8,
+    is_token_count: u8,
+    is_excluded_payload: u8,
+    is_search_or_open: u8,
+    doc_len: u32,
+    tf: u16,
+    #[serde(default)]
+    tf_norm: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SearchDocExtraRow {
+    event_uid: String,
+    session_id: String,
     source_name: String,
     provider: String,
     event_class: String,
@@ -140,12 +154,6 @@ struct CachedPostingRow {
     phase: String,
     source_ref: String,
     doc_len: u32,
-    tf: u16,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct SearchDocExtraRow {
-    event_uid: String,
     text_preview: String,
     has_codex_mcp: u8,
 }
@@ -179,8 +187,33 @@ struct ColumnExistsRow {
 
 #[derive(Debug, Deserialize)]
 struct SearchIndexWatermarkRow {
-    max_mod_unix_s: u64,
-    total_rows: u64,
+    docs_max_block: u64,
+    posts_max_block: u64,
+    docs_rows: u64,
+    posts_rows: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct SearchIndexWatermark {
+    docs_max_block: u64,
+    posts_max_block: u64,
+    docs_rows: u64,
+    posts_rows: u64,
+}
+
+impl SearchIndexWatermark {
+    fn from_rows(rows: &[SearchIndexWatermarkRow]) -> Self {
+        if let Some(row) = rows.first() {
+            Self {
+                docs_max_block: row.docs_max_block,
+                posts_max_block: row.posts_max_block,
+                docs_rows: row.docs_rows,
+                posts_rows: row.posts_rows,
+            }
+        } else {
+            Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -201,25 +234,36 @@ struct SearchStatsCache {
     corpus_stats: Option<CorpusStatsCacheEntry>,
     term_df_by_term: HashMap<String, TermDfCacheEntry>,
     has_codex_flag_column: Option<(bool, Instant)>,
-    search_index_watermark: Option<(String, Instant)>,
+    search_index_watermark: Option<(SearchIndexWatermark, Instant)>,
 }
 
 #[derive(Debug, Clone)]
 struct SearchEventsCacheEntry {
-    rows: Vec<SearchRow>,
+    hits: Vec<SearchEventHit>,
     fetched_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct TermPostingsCacheEntry {
-    watermark: String,
+    watermark: SearchIndexWatermark,
+    avgdl_bits: u64,
     rows: Arc<[CachedPostingRow]>,
     fetched_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct SearchDocExtraCacheEntry {
-    watermark: String,
+    watermark: SearchIndexWatermark,
+    session_id: String,
+    source_name: String,
+    provider: String,
+    event_class: String,
+    payload_type: String,
+    actor_role: String,
+    name: String,
+    phase: String,
+    source_ref: String,
+    doc_len: u32,
     text_preview: String,
     has_codex_mcp: u8,
     fetched_at: Instant,
@@ -264,7 +308,7 @@ impl ClickHouseConversationRepository {
         terms: &[String],
         docs: u64,
         total_doc_len: u64,
-        index_watermark: &str,
+        index_watermark: SearchIndexWatermark,
         include_tool_events: bool,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
@@ -275,19 +319,23 @@ impl ClickHouseConversationRepository {
         let mut cache_terms = terms.to_vec();
         cache_terms.sort_unstable();
         format!(
-            "docs={docs};total_doc_len={total_doc_len};idx_wm={index_watermark};incl_tools={include_tool_events};excl_codex={exclude_codex_mcp};session={};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
+            "docs={docs};total_doc_len={total_doc_len};idx_wm={}:{}:{}:{};incl_tools={include_tool_events};excl_codex={exclude_codex_mcp};session={};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
+            index_watermark.docs_max_block,
+            index_watermark.posts_max_block,
+            index_watermark.docs_rows,
+            index_watermark.posts_rows,
             session_id.unwrap_or(""),
             cache_terms.join(",")
         )
     }
 
-    async fn search_events_cache_get(&self, key: &str) -> Option<Vec<SearchRow>> {
+    async fn search_events_cache_get(&self, key: &str) -> Option<Vec<SearchEventHit>> {
         let now = Instant::now();
         {
             let cache = self.search_cache.read().await;
             if let Some(entry) = cache.get(key) {
                 if now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL {
-                    return Some(entry.rows.clone());
+                    return Some(entry.hits.clone());
                 }
             } else {
                 return None;
@@ -297,14 +345,14 @@ impl ClickHouseConversationRepository {
         let mut cache = self.search_cache.write().await;
         if let Some(entry) = cache.get(key) {
             if now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL {
-                return Some(entry.rows.clone());
+                return Some(entry.hits.clone());
             }
         }
         cache.remove(key);
         None
     }
 
-    async fn search_events_cache_put(&self, key: String, rows: &[SearchRow]) {
+    async fn search_events_cache_put(&self, key: String, hits: &[SearchEventHit]) {
         let now = Instant::now();
         let mut cache = self.search_cache.write().await;
         cache.retain(|_, entry| now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL);
@@ -322,7 +370,7 @@ impl ClickHouseConversationRepository {
         cache.insert(
             key,
             SearchEventsCacheEntry {
-                rows: rows.to_vec(),
+                hits: hits.to_vec(),
                 fetched_at: now,
             },
         );
@@ -775,6 +823,16 @@ FORMAT JSONEachRow",
         Ok(format!(
             "SELECT
   d.event_uid AS event_uid,
+  d.session_id AS session_id,
+  d.source_name AS source_name,
+  d.provider AS provider,
+  d.event_class AS event_class,
+  d.payload_type AS payload_type,
+  d.actor_role AS actor_role,
+  d.name AS name,
+  d.phase AS phase,
+  d.source_ref AS source_ref,
+  d.doc_len AS doc_len,
   leftUTF8(d.text_content, {preview}) AS text_preview,
   {codex_expr} AS has_codex_mcp
 FROM {documents_table} AS d
@@ -817,11 +875,13 @@ FORMAT JSONEachRow",
         Ok(exists)
     }
 
-    async fn fetch_search_index_watermark(&self) -> RepoResult<String> {
+    async fn fetch_search_index_watermark(&self) -> RepoResult<SearchIndexWatermark> {
         let query = format!(
             "SELECT
-  toUInt64(toUnixTimestamp(ifNull(max(modification_time), toDateTime(0)))) AS max_mod_unix_s,
-  toUInt64(ifNull(sum(rows), 0)) AS total_rows
+  toUInt64(ifNull(maxIf(max_block_number, table = 'search_documents'), 0)) AS docs_max_block,
+  toUInt64(ifNull(maxIf(max_block_number, table = 'search_postings'), 0)) AS posts_max_block,
+  toUInt64(ifNull(sumIf(rows, table = 'search_documents'), 0)) AS docs_rows,
+  toUInt64(ifNull(sumIf(rows, table = 'search_postings'), 0)) AS posts_rows
 FROM system.parts
 WHERE database = {}
   AND table IN ('search_documents', 'search_postings')
@@ -831,11 +891,7 @@ FORMAT JSONEachRow",
         );
         let rows: Vec<SearchIndexWatermarkRow> =
             self.map_backend(self.ch.query_rows(&query, Some("system")).await)?;
-        Ok(if let Some(row) = rows.first() {
-            format!("{}:{}", row.max_mod_unix_s, row.total_rows)
-        } else {
-            "0:0".to_string()
-        })
+        Ok(SearchIndexWatermark::from_rows(&rows))
     }
 
     fn refresh_search_index_watermark_async(&self) {
@@ -845,8 +901,10 @@ FORMAT JSONEachRow",
         tokio::spawn(async move {
             let query = format!(
                 "SELECT
-  toUInt64(toUnixTimestamp(ifNull(max(modification_time), toDateTime(0)))) AS max_mod_unix_s,
-  toUInt64(ifNull(sum(rows), 0)) AS total_rows
+  toUInt64(ifNull(maxIf(max_block_number, table = 'search_documents'), 0)) AS docs_max_block,
+  toUInt64(ifNull(maxIf(max_block_number, table = 'search_postings'), 0)) AS posts_max_block,
+  toUInt64(ifNull(sumIf(rows, table = 'search_documents'), 0)) AS docs_rows,
+  toUInt64(ifNull(sumIf(rows, table = 'search_postings'), 0)) AS posts_rows
 FROM system.parts
 WHERE database = {}
   AND table IN ('search_documents', 'search_postings')
@@ -859,14 +917,9 @@ FORMAT JSONEachRow",
                 ch.query_rows(&query, Some("system")).await;
             match rows {
                 Ok(rows) => {
-                    let watermark = if let Some(row) = rows.first() {
-                        format!("{}:{}", row.max_mod_unix_s, row.total_rows)
-                    } else {
-                        "0:0".to_string()
-                    };
-
                     let mut cache = cache.write().await;
-                    cache.search_index_watermark = Some((watermark, Instant::now()));
+                    cache.search_index_watermark =
+                        Some((SearchIndexWatermark::from_rows(&rows), Instant::now()));
                 }
                 Err(err) => {
                     warn!("failed to refresh search index watermark: {}", err);
@@ -875,13 +928,13 @@ FORMAT JSONEachRow",
         });
     }
 
-    async fn search_index_watermark(&self) -> RepoResult<String> {
+    async fn search_index_watermark(&self) -> RepoResult<SearchIndexWatermark> {
         let now = Instant::now();
         {
             let cache = self.stats_cache.read().await;
             if let Some((value, fetched_at)) = &cache.search_index_watermark {
                 if now.duration_since(*fetched_at) <= SEARCH_INDEX_WATERMARK_CACHE_TTL {
-                    return Ok(value.clone());
+                    return Ok(*value);
                 }
             }
         }
@@ -890,7 +943,7 @@ FORMAT JSONEachRow",
             let mut cache = self.stats_cache.write().await;
             if let Some((value, fetched_at)) = &mut cache.search_index_watermark {
                 if now.duration_since(*fetched_at) > SEARCH_INDEX_WATERMARK_CACHE_TTL {
-                    let stale = value.clone();
+                    let stale = *value;
                     *fetched_at = now;
                     drop(cache);
                     self.refresh_search_index_watermark_async();
@@ -901,7 +954,7 @@ FORMAT JSONEachRow",
 
         let watermark = self.fetch_search_index_watermark().await?;
         let mut cache = self.stats_cache.write().await;
-        cache.search_index_watermark = Some((watermark.clone(), now));
+        cache.search_index_watermark = Some((watermark, now));
         Ok(watermark)
     }
 
@@ -918,31 +971,19 @@ FORMAT JSONEachRow",
         }
 
         if include_tool_events {
-            if row.payload_type == "token_count" {
+            if row.is_token_count != 0 {
                 return false;
             }
         } else {
-            if !matches!(
-                row.event_class.as_str(),
-                "message" | "reasoning" | "event_msg"
-            ) {
+            if row.is_message_like == 0 {
                 return false;
             }
-            if matches!(
-                row.payload_type.as_str(),
-                "token_count"
-                    | "task_started"
-                    | "task_complete"
-                    | "turn_aborted"
-                    | "item_completed"
-            ) {
+            if row.is_excluded_payload != 0 {
                 return false;
             }
         }
 
-        if exclude_codex_mcp
-            && (row.name.eq_ignore_ascii_case("search") || row.name.eq_ignore_ascii_case("open"))
-        {
+        if exclude_codex_mcp && row.is_search_or_open != 0 {
             return false;
         }
 
@@ -959,12 +1000,24 @@ FORMAT JSONEachRow",
         }
     }
 
+    fn bm25_idf(docs: u64, df: u64) -> f64 {
+        let idf = if df == 0 {
+            (1.0 + ((docs as f64 + 0.5) / 0.5)).ln()
+        } else {
+            let n = docs.max(df) as f64;
+            (1.0 + ((n - df as f64 + 0.5) / (df as f64 + 0.5))).ln()
+        };
+        idf.max(0.0)
+    }
+
     async fn load_term_postings_for_terms(
         &self,
         terms: &[String],
-        watermark: &str,
+        watermark: SearchIndexWatermark,
+        avgdl: f64,
     ) -> RepoResult<HashMap<String, Arc<[CachedPostingRow]>>> {
         let now = Instant::now();
+        let avgdl_bits = avgdl.to_bits();
         let mut by_term = HashMap::<String, Arc<[CachedPostingRow]>>::new();
         let mut missing_terms = Vec::<String>::new();
 
@@ -973,6 +1026,7 @@ FORMAT JSONEachRow",
             for term in terms {
                 if let Some(entry) = cache.get(term) {
                     if entry.watermark == watermark
+                        && entry.avgdl_bits == avgdl_bits
                         && now.duration_since(entry.fetched_at) <= TERM_POSTINGS_CACHE_TTL
                     {
                         by_term.insert(term.clone(), Arc::clone(&entry.rows));
@@ -991,14 +1045,10 @@ FORMAT JSONEachRow",
   term,
   doc_id AS event_uid,
   session_id,
-  source_name,
-  provider,
-  event_class,
-  payload_type,
-  actor_role,
-  name,
-  phase,
-  source_ref,
+  toUInt8(event_class IN ('message', 'reasoning', 'event_msg')) AS is_message_like,
+  toUInt8(payload_type = 'token_count') AS is_token_count,
+  toUInt8(payload_type IN ('token_count', 'task_started', 'task_complete', 'turn_aborted', 'item_completed')) AS is_excluded_payload,
+  toUInt8(lowerUTF8(name) IN ('search', 'open')) AS is_search_or_open,
   doc_len,
   tf
 FROM {postings_table}
@@ -1006,18 +1056,19 @@ WHERE term IN {terms_array}
 FORMAT JSONEachRow",
             );
 
-            let fetched_rows: Vec<CachedPostingRow> =
+            let mut fetched_rows: Vec<CachedPostingRow> =
                 self.map_backend(self.ch.query_rows(&query, None).await)?;
+            let k1 = self.cfg.bm25_k1.max(0.01);
+            let b = self.cfg.bm25_b.clamp(0.0, 1.0);
+            for row in &mut fetched_rows {
+                row.tf_norm = Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b) as f32;
+            }
             let mut grouped = HashMap::<String, Vec<CachedPostingRow>>::new();
             for row in fetched_rows {
                 grouped.entry(row.term.clone()).or_default().push(row);
             }
 
             let mut cache = self.term_postings_cache.write().await;
-            cache.retain(|_, entry| {
-                entry.watermark == watermark
-                    && now.duration_since(entry.fetched_at) <= TERM_POSTINGS_CACHE_TTL
-            });
 
             for term in missing_terms {
                 let rows_vec = grouped.remove(&term).unwrap_or_default();
@@ -1026,7 +1077,8 @@ FORMAT JSONEachRow",
                 cache.insert(
                     term,
                     TermPostingsCacheEntry {
-                        watermark: watermark.to_string(),
+                        watermark,
+                        avgdl_bits,
                         rows,
                         fetched_at: now,
                     },
@@ -1057,7 +1109,7 @@ FORMAT JSONEachRow",
     async fn load_search_doc_extras(
         &self,
         event_uids: &[String],
-        watermark: &str,
+        watermark: SearchIndexWatermark,
         use_document_codex_flag: bool,
     ) -> RepoResult<HashMap<String, SearchDocExtraCacheEntry>> {
         let now = Instant::now();
@@ -1086,14 +1138,20 @@ FORMAT JSONEachRow",
                 self.map_backend(self.ch.query_rows(&query, None).await)?;
 
             let mut cache = self.search_doc_extra_cache.write().await;
-            cache.retain(|_, entry| {
-                entry.watermark == watermark
-                    && now.duration_since(entry.fetched_at) <= SEARCH_DOC_EXTRA_CACHE_TTL
-            });
 
             for row in fetched_rows {
                 let entry = SearchDocExtraCacheEntry {
-                    watermark: watermark.to_string(),
+                    watermark,
+                    session_id: row.session_id,
+                    source_name: row.source_name,
+                    provider: row.provider,
+                    event_class: row.event_class,
+                    payload_type: row.payload_type,
+                    actor_role: row.actor_role,
+                    name: row.name,
+                    phase: row.phase,
+                    source_ref: row.source_ref,
+                    doc_len: row.doc_len,
                     text_preview: row.text_preview,
                     has_codex_mcp: row.has_codex_mcp,
                     fetched_at: now,
@@ -1121,7 +1179,7 @@ FORMAT JSONEachRow",
     async fn search_events_rows(
         &self,
         terms: &[String],
-        idf_by_term: &HashMap<String, f64>,
+        docs: u64,
         avgdl: f64,
         include_tool_events: bool,
         exclude_codex_mcp: bool,
@@ -1134,7 +1192,7 @@ FORMAT JSONEachRow",
         let (initial_rows, initial_candidate_count) = self
             .search_events_rows_fast_pass(
                 terms,
-                idf_by_term,
+                docs,
                 avgdl,
                 include_tool_events,
                 exclude_codex_mcp,
@@ -1156,7 +1214,7 @@ FORMAT JSONEachRow",
             let (expanded_rows, expanded_candidate_count) = self
                 .search_events_rows_fast_pass(
                     terms,
-                    idf_by_term,
+                    docs,
                     avgdl,
                     include_tool_events,
                     exclude_codex_mcp,
@@ -1177,10 +1235,17 @@ FORMAT JSONEachRow",
 
         // Fast candidates were exhausted before we could satisfy the requested limit.
         // Fall back to the original SQL shape to preserve exact behavior.
+        let df_map = self.df_map(terms).await?;
+        let mut idf_by_term = HashMap::<String, f64>::new();
+        for term in terms {
+            let df = *df_map.get(term).unwrap_or(&0);
+            idf_by_term.insert(term.clone(), Self::bm25_idf(docs, df));
+        }
+
         let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
         let fallback_sql = self.build_search_events_sql(
             terms,
-            idf_by_term,
+            &idf_by_term,
             avgdl,
             include_tool_events,
             exclude_codex_mcp,
@@ -1200,7 +1265,7 @@ FORMAT JSONEachRow",
     async fn search_events_rows_fast_pass(
         &self,
         terms: &[String],
-        idf_by_term: &HashMap<String, f64>,
+        docs: u64,
         avgdl: f64,
         include_tool_events: bool,
         exclude_codex_mcp: bool,
@@ -1218,9 +1283,17 @@ FORMAT JSONEachRow",
         }
 
         let watermark = self.search_index_watermark().await?;
-        let postings_by_term = self.load_term_postings_for_terms(terms, &watermark).await?;
-        let k1 = self.cfg.bm25_k1.max(0.01);
-        let b = self.cfg.bm25_b.clamp(0.0, 1.0);
+        let postings_by_term = self
+            .load_term_postings_for_terms(terms, watermark, avgdl)
+            .await?;
+        let mut idf_by_term = HashMap::<&str, f64>::new();
+        for term in terms {
+            let df = postings_by_term
+                .get(term)
+                .map(|rows| rows.len() as u64)
+                .unwrap_or(0);
+            idf_by_term.insert(term.as_str(), Self::bm25_idf(docs, df));
+        }
 
         let mut fast_candidates = Vec::<CandidateRef<'_>>::new();
         if terms.len() == 1 {
@@ -1229,7 +1302,7 @@ FORMAT JSONEachRow",
             }
 
             let term = &terms[0];
-            let idf = *idf_by_term.get(term).unwrap_or(&0.0);
+            let idf = *idf_by_term.get(term.as_str()).unwrap_or(&0.0);
             if idf <= 0.0 {
                 return Ok((Vec::new(), 0));
             }
@@ -1245,7 +1318,7 @@ FORMAT JSONEachRow",
                         continue;
                     }
 
-                    let score = idf * Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
+                    let score = idf * row.tf_norm as f64;
                     if score < min_score {
                         continue;
                     }
@@ -1262,7 +1335,7 @@ FORMAT JSONEachRow",
                 if idx >= 64 {
                     break;
                 }
-                let idf = *idf_by_term.get(term).unwrap_or(&0.0);
+                let idf = *idf_by_term.get(term.as_str()).unwrap_or(&0.0);
                 if idf <= 0.0 {
                     continue;
                 }
@@ -1287,8 +1360,7 @@ FORMAT JSONEachRow",
                                     matched_mask: 0,
                                 });
 
-                        entry.score +=
-                            idf * Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
+                        entry.score += idf * row.tf_norm as f64;
                         entry.matched_mask |= 1u64 << idx;
                     }
                 }
@@ -1333,7 +1405,7 @@ FORMAT JSONEachRow",
             .collect();
         let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
         let doc_extras = self
-            .load_search_doc_extras(&event_uids, &watermark, use_document_codex_flag)
+            .load_search_doc_extras(&event_uids, watermark, use_document_codex_flag)
             .await?;
 
         let mut fast_rows = Vec::<SearchRow>::new();
@@ -1347,16 +1419,16 @@ FORMAT JSONEachRow",
 
             fast_rows.push(SearchRow {
                 event_uid: row.row.event_uid.clone(),
-                session_id: row.row.session_id.clone(),
-                source_name: row.row.source_name.clone(),
-                provider: row.row.provider.clone(),
-                event_class: row.row.event_class.clone(),
-                payload_type: row.row.payload_type.clone(),
-                actor_role: row.row.actor_role.clone(),
-                name: row.row.name.clone(),
-                phase: row.row.phase.clone(),
-                source_ref: row.row.source_ref.clone(),
-                doc_len: row.row.doc_len,
+                session_id: extra.session_id.clone(),
+                source_name: extra.source_name.clone(),
+                provider: extra.provider.clone(),
+                event_class: extra.event_class.clone(),
+                payload_type: extra.payload_type.clone(),
+                actor_role: extra.actor_role.clone(),
+                name: extra.name.clone(),
+                phase: extra.phase.clone(),
+                source_ref: extra.source_ref.clone(),
+                doc_len: extra.doc_len,
                 text_preview: extra.text_preview.clone(),
                 score: row.score,
                 matched_terms: row.matched_terms,
@@ -1512,7 +1584,7 @@ FORMAT JSONEachRow",
         include_tool_events: bool,
         exclude_codex_mcp: bool,
         took_ms: u32,
-        rows: &[SearchRow],
+        hits: &[SearchEventHit],
         docs: u64,
         avgdl: f64,
     ) {
@@ -1542,29 +1614,28 @@ FORMAT JSONEachRow",
             "include_tool_events": if include_tool_events { 1 } else { 0 },
             "exclude_codex_mcp": if exclude_codex_mcp { 1 } else { 0 },
             "response_ms": took_ms,
-            "result_count": rows.len() as u16,
+            "result_count": hits.len() as u16,
             "metadata_json": metadata_json,
         });
 
-        let hit_rows: Vec<Value> = rows
+        let hit_rows: Vec<Value> = hits
             .iter()
-            .enumerate()
-            .map(|(idx, row)| {
+            .map(|hit| {
                 json!({
                     "query_id": query_id,
-                    "rank": (idx + 1) as u16,
-                    "event_uid": row.event_uid,
-                    "session_id": row.session_id,
-                    "source_name": row.source_name,
-                    "provider": row.provider,
-                    "score": row.score,
-                    "matched_terms": row.matched_terms as u16,
-                    "doc_len": row.doc_len,
-                    "event_class": row.event_class,
-                    "payload_type": row.payload_type,
-                    "actor_role": row.actor_role,
-                    "name": row.name,
-                    "source_ref": row.source_ref,
+                    "rank": hit.rank as u16,
+                    "event_uid": hit.event_uid,
+                    "session_id": hit.session_id,
+                    "source_name": hit.source_name,
+                    "provider": hit.provider,
+                    "score": hit.score,
+                    "matched_terms": hit.matched_terms as u16,
+                    "doc_len": hit.doc_len,
+                    "event_class": hit.event_class,
+                    "payload_type": hit.payload_type,
+                    "actor_role": hit.actor_role,
+                    "name": hit.name,
+                    "source_ref": hit.source_ref,
                 })
             })
             .collect();
@@ -2003,7 +2074,11 @@ FORMAT JSONEachRow",
             .filter(|raw| !raw.is_empty())
             .unwrap_or("moraine-conversations");
 
-        let query_id = Uuid::new_v4().to_string();
+        let query_id = if source == BENCHMARK_REPLAY_SOURCE {
+            "benchmark-replay".to_string()
+        } else {
+            Uuid::new_v4().to_string()
+        };
         let started = Instant::now();
 
         let terms_with_qf = tokenize_query(query_text, self.cfg.bm25_max_query_terms);
@@ -2055,40 +2130,51 @@ FORMAT JSONEachRow",
         }
 
         let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
-        let rows = if disable_cache {
-            let df_map = self.df_map(&terms).await?;
+        let rows_to_hits = |rows: Vec<SearchRow>| -> Vec<SearchEventHit> {
+            rows.into_iter()
+                .enumerate()
+                .map(|(idx, row)| SearchEventHit {
+                    rank: idx + 1,
+                    event_uid: row.event_uid,
+                    session_id: row.session_id,
+                    source_name: row.source_name,
+                    provider: row.provider,
+                    score: row.score,
+                    matched_terms: row.matched_terms,
+                    doc_len: row.doc_len,
+                    event_class: row.event_class,
+                    payload_type: row.payload_type,
+                    actor_role: row.actor_role,
+                    name: row.name,
+                    phase: row.phase,
+                    source_ref: row.source_ref,
+                    text_preview: row.text_preview,
+                })
+                .collect()
+        };
 
-            let mut idf_by_term = HashMap::<String, f64>::new();
-            for term in &terms {
-                let df = *df_map.get(term).unwrap_or(&0);
-                let idf = if df == 0 {
-                    (1.0 + ((docs as f64 + 0.5) / 0.5)).ln()
-                } else {
-                    let n = docs.max(df) as f64;
-                    (1.0 + ((n - df as f64 + 0.5) / (df as f64 + 0.5))).ln()
-                };
-                idf_by_term.insert(term.clone(), idf.max(0.0));
-            }
-
-            self.search_events_rows(
-                &terms,
-                &idf_by_term,
-                avgdl,
-                include_tool_events,
-                exclude_codex_mcp,
-                session_id,
-                min_should_match,
-                min_score,
-                limit,
-            )
-            .await?
+        let hits = if disable_cache {
+            let rows = self
+                .search_events_rows(
+                    &terms,
+                    docs,
+                    avgdl,
+                    include_tool_events,
+                    exclude_codex_mcp,
+                    session_id,
+                    min_should_match,
+                    min_score,
+                    limit,
+                )
+                .await?;
+            rows_to_hits(rows)
         } else {
             let index_watermark = self.search_index_watermark().await?;
             let cache_key = Self::search_events_cache_key(
                 &terms,
                 docs,
                 total_doc_len,
-                &index_watermark,
+                index_watermark,
                 include_tool_events,
                 exclude_codex_mcp,
                 session_id,
@@ -2097,27 +2183,13 @@ FORMAT JSONEachRow",
                 limit,
             );
 
-            if let Some(cached_rows) = self.search_events_cache_get(&cache_key).await {
-                cached_rows
+            if let Some(cached_hits) = self.search_events_cache_get(&cache_key).await {
+                cached_hits
             } else {
-                let df_map = self.df_map(&terms).await?;
-
-                let mut idf_by_term = HashMap::<String, f64>::new();
-                for term in &terms {
-                    let df = *df_map.get(term).unwrap_or(&0);
-                    let idf = if df == 0 {
-                        (1.0 + ((docs as f64 + 0.5) / 0.5)).ln()
-                    } else {
-                        let n = docs.max(df) as f64;
-                        (1.0 + ((n - df as f64 + 0.5) / (df as f64 + 0.5))).ln()
-                    };
-                    idf_by_term.insert(term.clone(), idf.max(0.0));
-                }
-
                 let fresh_rows = self
                     .search_events_rows(
                         &terms,
-                        &idf_by_term,
+                        docs,
                         avgdl,
                         include_tool_events,
                         exclude_codex_mcp,
@@ -2127,34 +2199,13 @@ FORMAT JSONEachRow",
                         limit,
                     )
                     .await?;
-                self.search_events_cache_put(cache_key, &fresh_rows).await;
-                fresh_rows
+                let fresh_hits = rows_to_hits(fresh_rows);
+                self.search_events_cache_put(cache_key, &fresh_hits).await;
+                fresh_hits
             }
         };
 
         let took_ms = started.elapsed().as_millis() as u32;
-
-        let hits: Vec<SearchEventHit> = rows
-            .iter()
-            .enumerate()
-            .map(|(idx, row)| SearchEventHit {
-                rank: idx + 1,
-                event_uid: row.event_uid.clone(),
-                session_id: row.session_id.clone(),
-                source_name: row.source_name.clone(),
-                provider: row.provider.clone(),
-                score: row.score,
-                matched_terms: row.matched_terms,
-                doc_len: row.doc_len,
-                event_class: row.event_class.clone(),
-                payload_type: row.payload_type.clone(),
-                actor_role: row.actor_role.clone(),
-                name: row.name.clone(),
-                phase: row.phase.clone(),
-                source_ref: row.source_ref.clone(),
-                text_preview: row.text_preview.clone(),
-            })
-            .collect();
 
         if source != BENCHMARK_REPLAY_SOURCE {
             self.log_search_events(
@@ -2169,7 +2220,7 @@ FORMAT JSONEachRow",
                 include_tool_events,
                 exclude_codex_mcp,
                 took_ms,
-                &rows,
+                &hits,
                 docs,
                 avgdl,
             )

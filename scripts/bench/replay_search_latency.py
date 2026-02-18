@@ -191,6 +191,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow moraine-conversations search result cache during replay (default: disabled)",
     )
+    parser.add_argument(
+        "--parse-json-response",
+        action="store_true",
+        help=(
+            "Parse each search_events_json payload with json.loads during measured runs "
+            "(default: disabled to minimize benchmark-side JSON decode overhead)"
+        ),
+    )
     parser.add_argument("--output-json", help="Write machine-readable results JSON to this path")
     parser.add_argument(
         "--print-sql", action="store_true", help="Print selection SQL before execution"
@@ -688,6 +696,7 @@ def ensure_local_python_binding(repo_root: Path) -> None:
             "--manifest-path",
             str(manifest_path),
             "--locked",
+            "--release",
         ],
         cwd=repo_root,
         check=False,
@@ -731,6 +740,7 @@ class PackageSearchClient:
         clickhouse: ClickHouseSettings,
         timeout_seconds: int,
         disable_cache: bool,
+        parse_json_response: bool,
     ) -> None:
         self.client = conversation_client_cls(
             url=clickhouse.url,
@@ -741,8 +751,9 @@ class PackageSearchClient:
             max_results=65535,
         )
         self.disable_cache = disable_cache
+        self.parse_json_response = parse_json_response
 
-    def search(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def search(self, arguments: dict[str, Any]) -> Optional[dict[str, Any]]:
         payload = self.client.search_events_json(
             query=str(arguments["query"]),
             limit=int(arguments["limit"]),
@@ -754,6 +765,9 @@ class PackageSearchClient:
             disable_cache=self.disable_cache,
             source=BENCHMARK_REPLAY_SOURCE,
         )
+        if not self.parse_json_response:
+            return None
+
         parsed = json.loads(payload)
         if not isinstance(parsed, dict):
             raise RuntimeError(
@@ -794,6 +808,7 @@ def print_selection_summary(
     print(f"  max_query_terms: {args.max_query_terms}")
     print(f"  expanded_replay_cases: {len(expanded_replay_rows)}")
     print(f"  use_search_cache: {args.use_search_cache}")
+    print(f"  parse_json_response: {args.parse_json_response}")
     print(f"  selected_ts_range: {window_range}")
 
 
@@ -888,6 +903,7 @@ def build_output_json(
                 "query_variant_mode": args.query_variant_mode,
                 "max_query_terms": args.max_query_terms,
                 "use_search_cache": args.use_search_cache,
+                "parse_json_response": args.parse_json_response,
             },
             "selected_count": len(selected_rows),
             "replayed_count": len(replay_results),
@@ -1012,6 +1028,7 @@ def main() -> int:
             clickhouse=ch_cfg,
             timeout_seconds=args.timeout_seconds,
             disable_cache=not args.use_search_cache,
+            parse_json_response=args.parse_json_response,
         )
     except Exception as exc:
         print(f"fatal: failed to initialize local search client: {exc}", file=sys.stderr)
