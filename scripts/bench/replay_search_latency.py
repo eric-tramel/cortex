@@ -3,6 +3,7 @@
 # requires-python = ">=3.9"
 # dependencies = [
 #   "maturin>=1.6,<2",
+#   "psutil>=5.9,<8",
 # ]
 # ///
 from __future__ import annotations
@@ -11,6 +12,7 @@ import argparse
 import base64
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -24,6 +26,16 @@ from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
+
+try:  # pragma: no cover - import path is runtime-dependent
+    import resource
+except Exception:  # pragma: no cover - import path is runtime-dependent
+    resource = None
+
+try:  # pragma: no cover - import path is runtime-dependent
+    import psutil
+except Exception:  # pragma: no cover - import path is runtime-dependent
+    psutil = None
 
 WINDOW_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
 SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -52,6 +64,49 @@ class ReplaySpec:
     raw_query: str
     baseline_response_ms: float
     arguments: dict[str, Any]
+
+
+class ProcessMemoryTracker:
+    """Best-effort process RSS/peak tracker for memory-vs-latency benchmarking."""
+
+    def __init__(self) -> None:
+        self._process = None
+        if psutil is not None:
+            try:
+                self._process = psutil.Process(os.getpid())
+            except Exception:
+                self._process = None
+
+    def rss_source(self) -> str:
+        return "psutil" if self._process is not None else "unavailable"
+
+    def peak_source(self) -> str:
+        return "resource.ru_maxrss" if resource is not None else "unavailable"
+
+    def current_rss_bytes(self) -> Optional[int]:
+        if self._process is None:
+            return None
+        try:
+            return int(self._process.memory_info().rss)
+        except Exception:
+            return None
+
+    def peak_rss_bytes(self) -> Optional[int]:
+        if resource is None:
+            return None
+        try:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            raw_value = int(getattr(usage, "ru_maxrss", 0))
+        except Exception:
+            return None
+
+        if raw_value <= 0:
+            return None
+
+        # ru_maxrss is bytes on macOS and KiB on Linux/BSD.
+        if sys.platform == "darwin":
+            return raw_value
+        return raw_value * 1024
 
 
 def positive_int(value: str) -> int:
@@ -268,6 +323,19 @@ def format_optional_ms(value: Optional[float]) -> str:
     if value is None:
         return "-"
     return f"{value:.2f}"
+
+
+def bytes_to_mib(value: Optional[int]) -> Optional[float]:
+    if value is None:
+        return None
+    return float(value) / (1024.0 * 1024.0)
+
+
+def summarize_bytes_as_mib(values: list[int], include_p99: bool) -> Optional[dict[str, float]]:
+    if not values:
+        return None
+    values_mib = [float(value) / (1024.0 * 1024.0) for value in values]
+    return summarize_values(values_mib, include_p99=include_p99)
 
 
 def parse_int_like(value: Any, field_name: str) -> int:
@@ -765,12 +833,16 @@ def print_replay_table(results: list[dict[str, Any]]) -> None:
     print("\nPer-Query Replay")
     header = (
         f"{'rank':>4} {'case':>7} {'terms':>5} {'baseline':>9} {'p50':>8} {'p95':>8} "
-        f"{'delta_p50':>10} {'min':>8} {'max':>8} {'ok':>5} {'fail':>5}  query"
+        f"{'delta_p50':>10} {'min':>8} {'max':>8} {'rss+p50MiB':>10} {'peak+maxMiB':>12} "
+        f"{'ok':>5} {'fail':>5}  query"
     )
     print(header)
     print("-" * len(header))
     for result in results:
         stats = result.get("stats_ms") or {}
+        memory_stats = result.get("memory_stats_mib") or {}
+        rss_growth_stats = memory_stats.get("rss_growth") or {}
+        peak_delta_stats = memory_stats.get("peak_delta") or {}
         line = (
             f"{result['rank']:>4} "
             f"{str(result.get('variant_label', 'orig')):>7} "
@@ -781,6 +853,8 @@ def print_replay_table(results: list[dict[str, Any]]) -> None:
             f"{format_optional_ms(result.get('delta_p50_ms')):>10} "
             f"{format_optional_ms(stats.get('min')):>8} "
             f"{format_optional_ms(stats.get('max')):>8} "
+            f"{format_optional_ms(rss_growth_stats.get('p50')):>10} "
+            f"{format_optional_ms(peak_delta_stats.get('max')):>12} "
             f"{result['success_count']:>5} "
             f"{result['failure_count']:>5}  "
             f"{preview_query(result['query'])}"
@@ -871,7 +945,7 @@ def main() -> int:
             config_path=config_path,
             selected_rows=[],
             replay_results=[],
-            aggregate={"stats_ms": None, "successful_samples": 0},
+            aggregate={"stats_ms": None, "successful_samples": 0, "memory": None},
             failures={"timeouts": 0, "errors": 1},
             dry_run=args.dry_run,
         )
@@ -894,7 +968,7 @@ def main() -> int:
             config_path=config_path,
             selected_rows=selected_rows,
             replay_results=[],
-            aggregate={"stats_ms": None, "successful_samples": 0},
+            aggregate={"stats_ms": None, "successful_samples": 0, "memory": None},
             failures={"timeouts": 0, "errors": 0},
             dry_run=True,
         )
@@ -912,7 +986,7 @@ def main() -> int:
             config_path=config_path,
             selected_rows=selected_rows,
             replay_results=[],
-            aggregate={"stats_ms": None, "successful_samples": 0},
+            aggregate={"stats_ms": None, "successful_samples": 0, "memory": None},
             failures={"timeouts": 0, "errors": 1},
             dry_run=False,
         )
@@ -945,11 +1019,18 @@ def main() -> int:
 
     replay_results: list[dict[str, Any]] = []
     all_samples: list[float] = []
+    all_rss_growth_bytes: list[int] = []
+    all_peak_delta_bytes: list[int] = []
     failures = {"timeouts": 0, "errors": 0}
+    memory_tracker = ProcessMemoryTracker()
+    benchmark_rss_start_bytes = memory_tracker.current_rss_bytes()
+    benchmark_peak_start_bytes = memory_tracker.peak_rss_bytes()
 
     for spec in replayable_rows:
         warmup_samples: list[float] = []
         measured_samples: list[float] = []
+        measured_rss_growth_bytes: list[int] = []
+        measured_peak_delta_bytes: list[int] = []
         query_failures: list[dict[str, Any]] = []
 
         for idx in range(args.warmup):
@@ -972,10 +1053,19 @@ def main() -> int:
 
         for idx in range(args.repeats):
             try:
+                rss_before_bytes = memory_tracker.current_rss_bytes()
+                peak_before_bytes = memory_tracker.peak_rss_bytes()
                 start_ns = time.perf_counter_ns()
                 client.search(spec.arguments)
                 elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+                rss_after_bytes = memory_tracker.current_rss_bytes()
+                peak_after_bytes = memory_tracker.peak_rss_bytes()
                 measured_samples.append(elapsed_ms)
+
+                if rss_before_bytes is not None and rss_after_bytes is not None:
+                    measured_rss_growth_bytes.append(max(0, rss_after_bytes - rss_before_bytes))
+                if peak_before_bytes is not None and peak_after_bytes is not None:
+                    measured_peak_delta_bytes.append(max(0, peak_after_bytes - peak_before_bytes))
             except Exception as exc:
                 failure_type = classify_failure(exc)
                 failures["timeouts" if failure_type == "timeout" else "errors"] += 1
@@ -989,10 +1079,16 @@ def main() -> int:
                 )
 
         stats_ms = summarize_values(measured_samples, include_p99=False)
+        memory_stats_mib = {
+            "rss_growth": summarize_bytes_as_mib(measured_rss_growth_bytes, include_p99=False),
+            "peak_delta": summarize_bytes_as_mib(measured_peak_delta_bytes, include_p99=False),
+        }
         delta_p50_ms = None
         if stats_ms is not None:
             delta_p50_ms = stats_ms["p50"] - spec.baseline_response_ms
             all_samples.extend(measured_samples)
+            all_rss_growth_bytes.extend(measured_rss_growth_bytes)
+            all_peak_delta_bytes.extend(measured_peak_delta_bytes)
 
         replay_results.append(
             {
@@ -1010,6 +1106,11 @@ def main() -> int:
                 "measured_samples_ms": measured_samples,
                 "stats_ms": stats_ms,
                 "delta_p50_ms": delta_p50_ms,
+                "memory_samples_mib": {
+                    "rss_growth": [value / (1024.0 * 1024.0) for value in measured_rss_growth_bytes],
+                    "peak_delta": [value / (1024.0 * 1024.0) for value in measured_peak_delta_bytes],
+                },
+                "memory_stats_mib": memory_stats_mib,
                 "success_count": len(measured_samples),
                 "failure_count": len(query_failures),
                 "failures": query_failures,
@@ -1019,11 +1120,50 @@ def main() -> int:
     print_replay_table(replay_results)
 
     aggregate_stats = summarize_values(all_samples, include_p99=True)
+    benchmark_rss_end_bytes = memory_tracker.current_rss_bytes()
+    benchmark_peak_end_bytes = memory_tracker.peak_rss_bytes()
+
+    benchmark_rss_delta_bytes = None
+    if benchmark_rss_start_bytes is not None and benchmark_rss_end_bytes is not None:
+        benchmark_rss_delta_bytes = benchmark_rss_end_bytes - benchmark_rss_start_bytes
+
+    benchmark_peak_delta_bytes = None
+    if benchmark_peak_start_bytes is not None and benchmark_peak_end_bytes is not None:
+        benchmark_peak_delta_bytes = max(0, benchmark_peak_end_bytes - benchmark_peak_start_bytes)
+
+    aggregate_memory = {
+        "rss_source": memory_tracker.rss_source(),
+        "peak_source": memory_tracker.peak_source(),
+        "benchmark_rss_bytes": {
+            "start": benchmark_rss_start_bytes,
+            "end": benchmark_rss_end_bytes,
+            "delta": benchmark_rss_delta_bytes,
+        },
+        "benchmark_peak_rss_bytes": {
+            "start": benchmark_peak_start_bytes,
+            "end": benchmark_peak_end_bytes,
+            "delta": benchmark_peak_delta_bytes,
+        },
+        "benchmark_rss_mib": {
+            "start": bytes_to_mib(benchmark_rss_start_bytes),
+            "end": bytes_to_mib(benchmark_rss_end_bytes),
+            "delta": bytes_to_mib(benchmark_rss_delta_bytes),
+        },
+        "benchmark_peak_rss_mib": {
+            "start": bytes_to_mib(benchmark_peak_start_bytes),
+            "end": bytes_to_mib(benchmark_peak_end_bytes),
+            "delta": bytes_to_mib(benchmark_peak_delta_bytes),
+        },
+        "query_rss_growth_mib": summarize_bytes_as_mib(all_rss_growth_bytes, include_p99=True),
+        "query_peak_delta_mib": summarize_bytes_as_mib(all_peak_delta_bytes, include_p99=True),
+    }
+
     failure_total = failures["timeouts"] + failures["errors"]
 
     aggregate = {
         "successful_samples": len(all_samples),
         "stats_ms": aggregate_stats,
+        "memory": aggregate_memory,
         "failure_total": failure_total,
         "timeout_count": failures["timeouts"],
         "error_count": failures["errors"],
@@ -1045,6 +1185,61 @@ def main() -> int:
         )
     print(f"  timeout_count: {aggregate['timeout_count']}")
     print(f"  error_count: {aggregate['error_count']}")
+    print(
+        "  memory_sources: "
+        f"rss={aggregate_memory['rss_source']} "
+        f"peak={aggregate_memory['peak_source']}"
+    )
+
+    benchmark_rss_mib = aggregate_memory["benchmark_rss_mib"]
+    if benchmark_rss_mib["start"] is None or benchmark_rss_mib["end"] is None:
+        print("  benchmark_rss_mib: -")
+    else:
+        print(
+            "  benchmark_rss_mib: "
+            f"start={benchmark_rss_mib['start']:.2f} "
+            f"end={benchmark_rss_mib['end']:.2f} "
+            f"delta={benchmark_rss_mib['delta']:.2f}"
+        )
+
+    benchmark_peak_mib = aggregate_memory["benchmark_peak_rss_mib"]
+    if benchmark_peak_mib["start"] is None or benchmark_peak_mib["end"] is None:
+        print("  benchmark_peak_rss_mib: -")
+    else:
+        print(
+            "  benchmark_peak_rss_mib: "
+            f"start={benchmark_peak_mib['start']:.2f} "
+            f"end={benchmark_peak_mib['end']:.2f} "
+            f"delta={benchmark_peak_mib['delta']:.2f}"
+        )
+
+    query_rss_growth_mib = aggregate_memory["query_rss_growth_mib"]
+    if query_rss_growth_mib is None:
+        print("  query_rss_growth_mib: -")
+    else:
+        print(
+            "  query_rss_growth_mib: "
+            f"min={query_rss_growth_mib['min']:.2f} "
+            f"p50={query_rss_growth_mib['p50']:.2f} "
+            f"p95={query_rss_growth_mib['p95']:.2f} "
+            f"p99={query_rss_growth_mib['p99']:.2f} "
+            f"max={query_rss_growth_mib['max']:.2f} "
+            f"avg={query_rss_growth_mib['avg']:.2f}"
+        )
+
+    query_peak_delta_mib = aggregate_memory["query_peak_delta_mib"]
+    if query_peak_delta_mib is None:
+        print("  query_peak_delta_mib: -")
+    else:
+        print(
+            "  query_peak_delta_mib: "
+            f"min={query_peak_delta_mib['min']:.2f} "
+            f"p50={query_peak_delta_mib['p50']:.2f} "
+            f"p95={query_peak_delta_mib['p95']:.2f} "
+            f"p99={query_peak_delta_mib['p99']:.2f} "
+            f"max={query_peak_delta_mib['max']:.2f} "
+            f"avg={query_peak_delta_mib['avg']:.2f}"
+        )
 
     payload = build_output_json(
         args=args,
