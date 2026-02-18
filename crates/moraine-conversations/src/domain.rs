@@ -188,6 +188,8 @@ pub struct SearchEventsQuery {
     pub include_tool_events: Option<bool>,
     #[serde(default)]
     pub exclude_codex_mcp: Option<bool>,
+    #[serde(default)]
+    pub disable_cache: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

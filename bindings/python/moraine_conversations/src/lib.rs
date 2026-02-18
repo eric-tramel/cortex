@@ -148,6 +148,7 @@ impl ConversationClient {
         min_should_match=None,
         include_tool_events=None,
         exclude_codex_mcp=None,
+        disable_cache=None,
         source=None,
     ))]
     fn search_events_json(
@@ -159,6 +160,7 @@ impl ConversationClient {
         min_should_match: Option<u16>,
         include_tool_events: Option<bool>,
         exclude_codex_mcp: Option<bool>,
+        disable_cache: Option<bool>,
         source: Option<String>,
     ) -> PyResult<String> {
         let results = self
@@ -172,6 +174,7 @@ impl ConversationClient {
                 min_should_match,
                 include_tool_events,
                 exclude_codex_mcp,
+                disable_cache,
             }))
             .map_err(py_runtime_err)?;
 

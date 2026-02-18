@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
@@ -8,6 +8,7 @@ use moraine_clickhouse::ClickHouseClient;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::RwLock;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -26,7 +27,20 @@ use crate::repo::ConversationRepository;
 pub struct ClickHouseConversationRepository {
     ch: ClickHouseClient,
     cfg: RepoConfig,
+    stats_cache: Arc<RwLock<SearchStatsCache>>,
+    search_cache: Arc<RwLock<HashMap<String, SearchEventsCacheEntry>>>,
 }
+
+const BENCHMARK_REPLAY_SOURCE: &str = "benchmark-replay";
+const CORPUS_STATS_CACHE_TTL: Duration = Duration::from_secs(30);
+const TERM_DF_CACHE_TTL: Duration = Duration::from_secs(300);
+const SEARCH_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
+const SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
+const SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
+const SEARCH_INDEX_WATERMARK_CACHE_TTL: Duration = Duration::from_millis(250);
+const SEARCH_FAST_CANDIDATE_MULTIPLIER: usize = 1;
+const SEARCH_FAST_CANDIDATE_MIN_EXTRA: usize = 0;
+const SEARCH_FAST_CANDIDATE_LIMIT_CAP: usize = 256;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ConversationSummaryRow {
@@ -88,7 +102,7 @@ struct OpenTargetRow {
     turn_seq: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SearchRow {
     event_uid: String,
     session_id: String,
@@ -102,6 +116,26 @@ struct SearchRow {
     source_ref: String,
     doc_len: u32,
     text_preview: String,
+    score: f64,
+    matched_terms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SearchCandidateRow {
+    event_uid: String,
+    session_id: String,
+    source_name: String,
+    provider: String,
+    event_class: String,
+    payload_type: String,
+    actor_role: String,
+    name: String,
+    phase: String,
+    source_ref: String,
+    doc_len: u32,
+    text_preview: String,
+    has_codex_mcp: u8,
+    lower_name: String,
     score: f64,
     matched_terms: u64,
 }
@@ -128,9 +162,52 @@ struct ConversationSearchRow {
     snippet: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ColumnExistsRow {
+    exists: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchIndexWatermarkRow {
+    max_mod_unix_s: u64,
+    total_rows: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CorpusStatsCacheEntry {
+    docs: u64,
+    total_doc_len: u64,
+    fetched_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct TermDfCacheEntry {
+    df: u64,
+    fetched_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct SearchStatsCache {
+    corpus_stats: Option<CorpusStatsCacheEntry>,
+    term_df_by_term: HashMap<String, TermDfCacheEntry>,
+    has_codex_flag_column: Option<(bool, Instant)>,
+    search_index_watermark: Option<(String, Instant)>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchEventsCacheEntry {
+    rows: Vec<SearchRow>,
+    fetched_at: Instant,
+}
+
 impl ClickHouseConversationRepository {
     pub fn new(ch: ClickHouseClient, cfg: RepoConfig) -> Self {
-        Self { ch, cfg }
+        Self {
+            ch,
+            cfg,
+            stats_cache: Arc::new(RwLock::new(SearchStatsCache::default())),
+            search_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     pub fn config(&self) -> &RepoConfig {
@@ -147,6 +224,74 @@ impl ClickHouseConversationRepository {
 
     fn map_backend<T>(&self, result: AnyResult<T>) -> RepoResult<T> {
         result.map_err(|err| RepoError::backend(err.to_string()))
+    }
+
+    fn search_events_cache_key(
+        terms: &[String],
+        docs: u64,
+        total_doc_len: u64,
+        index_watermark: &str,
+        include_tool_events: bool,
+        exclude_codex_mcp: bool,
+        session_id: Option<&str>,
+        min_should_match: u16,
+        min_score: f64,
+        limit: u16,
+    ) -> String {
+        let mut cache_terms = terms.to_vec();
+        cache_terms.sort_unstable();
+        format!(
+            "docs={docs};total_doc_len={total_doc_len};idx_wm={index_watermark};incl_tools={include_tool_events};excl_codex={exclude_codex_mcp};session={};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
+            session_id.unwrap_or(""),
+            cache_terms.join(",")
+        )
+    }
+
+    async fn search_events_cache_get(&self, key: &str) -> Option<Vec<SearchRow>> {
+        let now = Instant::now();
+        {
+            let cache = self.search_cache.read().await;
+            if let Some(entry) = cache.get(key) {
+                if now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL {
+                    return Some(entry.rows.clone());
+                }
+            } else {
+                return None;
+            }
+        }
+
+        let mut cache = self.search_cache.write().await;
+        if let Some(entry) = cache.get(key) {
+            if now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL {
+                return Some(entry.rows.clone());
+            }
+        }
+        cache.remove(key);
+        None
+    }
+
+    async fn search_events_cache_put(&self, key: String, rows: &[SearchRow]) {
+        let now = Instant::now();
+        let mut cache = self.search_cache.write().await;
+        cache.retain(|_, entry| now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL);
+
+        if cache.len() >= SEARCH_RESULT_CACHE_MAX_ENTRIES {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+
+        cache.insert(
+            key,
+            SearchEventsCacheEntry {
+                rows: rows.to_vec(),
+                fetched_at: now,
+            },
+        );
     }
 
     fn mode_subquery(&self) -> String {
@@ -351,6 +496,16 @@ FORMAT JSONEachRow",
     }
 
     async fn corpus_stats(&self) -> RepoResult<(u64, u64)> {
+        let now = Instant::now();
+        {
+            let cache = self.stats_cache.read().await;
+            if let Some(entry) = cache.corpus_stats.as_ref() {
+                if now.duration_since(entry.fetched_at) <= CORPUS_STATS_CACHE_TTL {
+                    return Ok((entry.docs, entry.total_doc_len));
+                }
+            }
+        }
+
         let from_stats_query = format!(
             "SELECT toUInt64(ifNull(sum(docs), 0)) AS docs, toUInt64(ifNull(sum(total_doc_len), 0)) AS total_doc_len FROM {} FORMAT JSONEachRow",
             self.table_ref("search_corpus_stats")
@@ -361,6 +516,8 @@ FORMAT JSONEachRow",
 
         if let Some(row) = from_stats.first() {
             if row.docs > 0 {
+                self.cache_corpus_stats(row.docs, row.total_doc_len, now)
+                    .await;
                 return Ok((row.docs, row.total_doc_len));
             }
         }
@@ -371,42 +528,83 @@ FORMAT JSONEachRow",
         );
         let fallback: Vec<CorpusStatsRow> =
             self.map_backend(self.ch.query_rows(&fallback_query, None).await)?;
-        if let Some(row) = fallback.first() {
-            Ok((row.docs, row.total_doc_len))
+        let resolved = if let Some(row) = fallback.first() {
+            (row.docs, row.total_doc_len)
         } else {
-            Ok((0, 0))
+            (0, 0)
+        };
+
+        let mut cache = self.stats_cache.write().await;
+        cache.corpus_stats = Some(CorpusStatsCacheEntry {
+            docs: resolved.0,
+            total_doc_len: resolved.1,
+            fetched_at: now,
+        });
+        Ok(resolved)
+    }
+
+    async fn cache_corpus_stats(&self, docs: u64, total_doc_len: u64, fetched_at: Instant) {
+        let mut cache = self.stats_cache.write().await;
+        cache.corpus_stats = Some(CorpusStatsCacheEntry {
+            docs,
+            total_doc_len,
+            fetched_at,
+        });
+    }
+
+    async fn cache_term_df_values(
+        &self,
+        terms: impl IntoIterator<Item = String>,
+        map: &HashMap<String, u64>,
+        fetched_at: Instant,
+    ) {
+        let mut cache = self.stats_cache.write().await;
+        for term in terms {
+            let df = *map.get(&term).unwrap_or(&0);
+            cache
+                .term_df_by_term
+                .insert(term, TermDfCacheEntry { df, fetched_at });
         }
     }
 
     async fn df_map(&self, terms: &[String]) -> RepoResult<HashMap<String, u64>> {
-        let terms_array = sql_array_strings(terms);
-        let term_stats_table = self.table_ref("search_term_stats");
+        let now = Instant::now();
         let postings_table = self.table_ref("search_postings");
-        let primary_query = format!(
-            "SELECT term, toUInt64(sum(docs)) AS df FROM {term_stats_table} WHERE term IN {terms_array} GROUP BY term FORMAT JSONEachRow",
-        );
 
         let mut map = HashMap::<String, u64>::new();
+        let mut missing_terms = Vec::<String>::new();
 
-        let primary_rows: Vec<DfRow> =
-            self.map_backend(self.ch.query_rows(&primary_query, None).await)?;
-        for row in primary_rows {
-            map.insert(row.term, row.df);
+        {
+            let cache = self.stats_cache.read().await;
+            for term in terms {
+                if let Some(entry) = cache.term_df_by_term.get(term) {
+                    if now.duration_since(entry.fetched_at) <= TERM_DF_CACHE_TTL {
+                        map.insert(term.clone(), entry.df);
+                        continue;
+                    }
+                }
+                missing_terms.push(term.clone());
+            }
         }
 
-        if map.len() == terms.len() {
+        if missing_terms.is_empty() {
             return Ok(map);
         }
 
-        let fallback_query = format!(
-            "SELECT term, count() AS df FROM {postings_table} FINAL WHERE term IN {terms_array} GROUP BY term FORMAT JSONEachRow",
+        let missing_terms_array = sql_array_strings(&missing_terms);
+        let df_query = format!(
+            "SELECT term, toUInt64(uniqExact(doc_id)) AS df FROM {postings_table} WHERE term IN {missing_terms_array} GROUP BY term FORMAT JSONEachRow",
         );
-        let fallback_rows: Vec<DfRow> =
-            self.map_backend(self.ch.query_rows(&fallback_query, None).await)?;
-        for row in fallback_rows {
+        let rows: Vec<DfRow> = self.map_backend(self.ch.query_rows(&df_query, None).await)?;
+        for row in rows {
             map.insert(row.term, row.df);
         }
 
+        for term in &missing_terms {
+            map.entry(term.clone()).or_insert(0);
+        }
+
+        self.cache_term_df_values(missing_terms, &map, now).await;
         Ok(map)
     }
 
@@ -417,6 +615,7 @@ FORMAT JSONEachRow",
         avgdl: f64,
         include_tool_events: bool,
         exclude_codex_mcp: bool,
+        use_document_codex_flag: bool,
         session_id: Option<&str>,
         min_should_match: u16,
         min_score: f64,
@@ -455,8 +654,13 @@ FORMAT JSONEachRow",
         }
 
         if exclude_codex_mcp {
-            where_clauses
-                .push("positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') = 0".to_string());
+            if use_document_codex_flag {
+                where_clauses.push("toUInt8(d.has_codex_mcp) = 0".to_string());
+            } else {
+                where_clauses.push(
+                    "positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') = 0".to_string(),
+                );
+            }
             where_clauses.push("lowerUTF8(d.name) NOT IN ('search', 'open')".to_string());
         }
 
@@ -506,6 +710,394 @@ FORMAT JSONEachRow",
             postings_table = postings_table,
             documents_table = documents_table,
         ))
+    }
+
+    fn fast_search_candidate_limit(limit: u16) -> u16 {
+        let limit_usize = limit as usize;
+        let expanded = (limit_usize * SEARCH_FAST_CANDIDATE_MULTIPLIER)
+            .max(limit_usize + SEARCH_FAST_CANDIDATE_MIN_EXTRA)
+            .min(SEARCH_FAST_CANDIDATE_LIMIT_CAP);
+        expanded as u16
+    }
+
+    fn build_search_events_fast_candidates_sql(
+        &self,
+        terms: &[String],
+        idf_by_term: &HashMap<String, f64>,
+        avgdl: f64,
+        include_tool_events: bool,
+        exclude_codex_mcp: bool,
+        session_id: Option<&str>,
+        min_should_match: u16,
+        min_score: f64,
+        candidate_limit: u16,
+        use_document_codex_flag: bool,
+    ) -> RepoResult<String> {
+        if terms.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "cannot build search query with empty terms",
+            ));
+        }
+
+        let postings_table = self.table_ref("search_postings");
+        let documents_table = self.table_ref("search_documents");
+        let terms_array_sql = sql_array_strings(terms);
+        let idf_vals: Vec<f64> = terms
+            .iter()
+            .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
+            .collect();
+        let idf_array_sql = sql_array_f64(&idf_vals);
+        let codex_expr = if use_document_codex_flag {
+            "toUInt8(d.has_codex_mcp)"
+        } else {
+            "toUInt8(positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') > 0)"
+        };
+
+        let mut where_clauses = vec![format!("p.term IN {}", terms_array_sql)];
+
+        if let Some(sid) = session_id {
+            where_clauses.push(format!("p.session_id = {}", sql_quote(sid)));
+        }
+
+        if include_tool_events {
+            where_clauses.push("p.payload_type != 'token_count'".to_string());
+        } else {
+            where_clauses
+                .push("p.event_class IN ('message', 'reasoning', 'event_msg')".to_string());
+            where_clauses.push(
+                "p.payload_type NOT IN ('token_count', 'task_started', 'task_complete', 'turn_aborted', 'item_completed')"
+                    .to_string(),
+            );
+        }
+
+        // Name-based exclusion can be done against postings directly.
+        if exclude_codex_mcp {
+            where_clauses.push("lowerUTF8(p.name) NOT IN ('search', 'open')".to_string());
+        }
+
+        let where_sql = where_clauses.join("\n  AND ");
+        let k1 = self.cfg.bm25_k1.max(0.01);
+        let b = self.cfg.bm25_b.clamp(0.0, 1.0);
+
+        Ok(format!(
+            "WITH
+  {k1:.6} AS k1,
+  {b:.6} AS b,
+  greatest({avgdl:.6}, 1.0) AS avgdl,
+  {terms_array_sql} AS q_terms,
+  {idf_array_sql} AS q_idf
+SELECT
+  c.event_uid AS event_uid,
+  d.session_id AS session_id,
+  d.source_name AS source_name,
+  d.provider AS provider,
+  d.event_class AS event_class,
+  d.payload_type AS payload_type,
+  d.actor_role AS actor_role,
+  d.name AS name,
+  d.phase AS phase,
+  d.source_ref AS source_ref,
+  d.doc_len AS doc_len,
+  leftUTF8(d.text_content, {preview}) AS text_preview,
+  {codex_expr} AS has_codex_mcp,
+  lowerUTF8(d.name) AS lower_name,
+  c.score AS score,
+  c.matched_terms AS matched_terms
+FROM (
+  SELECT
+    p.doc_id AS event_uid,
+    sum(
+      transform(p.term, q_terms, q_idf, 0.0)
+      *
+      (
+        (toFloat64(p.tf) * (k1 + 1.0))
+        /
+        (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl)))
+      )
+    ) AS score,
+    uniqExact(p.term) AS matched_terms
+  FROM {postings_table} AS p
+  WHERE {where_sql}
+  GROUP BY p.doc_id
+  HAVING matched_terms >= {min_should_match} AND score >= {min_score:.6}
+  ORDER BY score DESC
+  LIMIT {candidate_limit}
+) AS c
+ANY INNER JOIN {documents_table} AS d ON d.event_uid = c.event_uid
+ORDER BY c.score DESC
+FORMAT JSONEachRow",
+            postings_table = postings_table,
+            documents_table = documents_table,
+            min_should_match = min_should_match,
+            min_score = min_score,
+            candidate_limit = candidate_limit,
+            preview = self.cfg.preview_chars,
+            codex_expr = codex_expr,
+        ))
+    }
+
+    async fn search_documents_has_codex_flag(&self) -> RepoResult<bool> {
+        let now = Instant::now();
+        {
+            let cache = self.stats_cache.read().await;
+            if let Some((value, fetched_at)) = cache.has_codex_flag_column {
+                if now.duration_since(fetched_at) <= SEARCH_SCHEMA_CACHE_TTL {
+                    return Ok(value);
+                }
+            }
+        }
+
+        let query = format!(
+            "SELECT
+  toUInt8(count() > 0) AS exists
+FROM system.columns
+WHERE database = {}
+  AND table = 'search_documents'
+  AND name = 'has_codex_mcp'
+FORMAT JSONEachRow",
+            sql_quote(&self.ch.config().database)
+        );
+        let rows: Vec<ColumnExistsRow> =
+            self.map_backend(self.ch.query_rows(&query, None).await)?;
+        let exists = rows.first().map(|row| row.exists != 0).unwrap_or(false);
+
+        let mut cache = self.stats_cache.write().await;
+        cache.has_codex_flag_column = Some((exists, now));
+        Ok(exists)
+    }
+
+    async fn fetch_search_index_watermark(&self) -> RepoResult<String> {
+        let query = format!(
+            "SELECT
+  toUInt64(toUnixTimestamp(ifNull(max(modification_time), toDateTime(0)))) AS max_mod_unix_s,
+  toUInt64(ifNull(sum(rows), 0)) AS total_rows
+FROM system.parts
+WHERE database = {}
+  AND table IN ('search_documents', 'search_postings')
+  AND active
+FORMAT JSONEachRow",
+            sql_quote(&self.ch.config().database)
+        );
+        let rows: Vec<SearchIndexWatermarkRow> =
+            self.map_backend(self.ch.query_rows(&query, Some("system")).await)?;
+        Ok(if let Some(row) = rows.first() {
+            format!("{}:{}", row.max_mod_unix_s, row.total_rows)
+        } else {
+            "0:0".to_string()
+        })
+    }
+
+    fn refresh_search_index_watermark_async(&self) {
+        let ch = self.ch.clone();
+        let cache = self.stats_cache.clone();
+        let database = self.ch.config().database.clone();
+        tokio::spawn(async move {
+            let query = format!(
+                "SELECT
+  toUInt64(toUnixTimestamp(ifNull(max(modification_time), toDateTime(0)))) AS max_mod_unix_s,
+  toUInt64(ifNull(sum(rows), 0)) AS total_rows
+FROM system.parts
+WHERE database = {}
+  AND table IN ('search_documents', 'search_postings')
+  AND active
+FORMAT JSONEachRow",
+                sql_quote(&database)
+            );
+
+            let rows: AnyResult<Vec<SearchIndexWatermarkRow>> =
+                ch.query_rows(&query, Some("system")).await;
+            match rows {
+                Ok(rows) => {
+                    let watermark = if let Some(row) = rows.first() {
+                        format!("{}:{}", row.max_mod_unix_s, row.total_rows)
+                    } else {
+                        "0:0".to_string()
+                    };
+
+                    let mut cache = cache.write().await;
+                    cache.search_index_watermark = Some((watermark, Instant::now()));
+                }
+                Err(err) => {
+                    warn!("failed to refresh search index watermark: {}", err);
+                }
+            }
+        });
+    }
+
+    async fn search_index_watermark(&self) -> RepoResult<String> {
+        let now = Instant::now();
+        {
+            let cache = self.stats_cache.read().await;
+            if let Some((value, fetched_at)) = &cache.search_index_watermark {
+                if now.duration_since(*fetched_at) <= SEARCH_INDEX_WATERMARK_CACHE_TTL {
+                    return Ok(value.clone());
+                }
+            }
+        }
+
+        {
+            let mut cache = self.stats_cache.write().await;
+            if let Some((value, fetched_at)) = &mut cache.search_index_watermark {
+                if now.duration_since(*fetched_at) > SEARCH_INDEX_WATERMARK_CACHE_TTL {
+                    let stale = value.clone();
+                    *fetched_at = now;
+                    drop(cache);
+                    self.refresh_search_index_watermark_async();
+                    return Ok(stale);
+                }
+            }
+        }
+
+        let watermark = self.fetch_search_index_watermark().await?;
+        let mut cache = self.stats_cache.write().await;
+        cache.search_index_watermark = Some((watermark.clone(), now));
+        Ok(watermark)
+    }
+
+    async fn search_events_rows(
+        &self,
+        terms: &[String],
+        idf_by_term: &HashMap<String, f64>,
+        avgdl: f64,
+        include_tool_events: bool,
+        exclude_codex_mcp: bool,
+        session_id: Option<&str>,
+        min_should_match: u16,
+        min_score: f64,
+        limit: u16,
+    ) -> RepoResult<Vec<SearchRow>> {
+        let initial_candidate_limit = Self::fast_search_candidate_limit(limit);
+        let (initial_rows, initial_candidate_count) = self
+            .search_events_rows_fast_pass(
+                terms,
+                idf_by_term,
+                avgdl,
+                include_tool_events,
+                exclude_codex_mcp,
+                session_id,
+                min_should_match,
+                min_score,
+                limit,
+                initial_candidate_limit,
+            )
+            .await?;
+        if initial_rows.len() >= limit as usize
+            || initial_candidate_count < initial_candidate_limit as usize
+        {
+            return Ok(initial_rows);
+        }
+
+        let expanded_candidate_limit = SEARCH_FAST_CANDIDATE_LIMIT_CAP as u16;
+        if expanded_candidate_limit > initial_candidate_limit {
+            let (expanded_rows, expanded_candidate_count) = self
+                .search_events_rows_fast_pass(
+                    terms,
+                    idf_by_term,
+                    avgdl,
+                    include_tool_events,
+                    exclude_codex_mcp,
+                    session_id,
+                    min_should_match,
+                    min_score,
+                    limit,
+                    expanded_candidate_limit,
+                )
+                .await?;
+
+            if expanded_rows.len() >= limit as usize
+                || expanded_candidate_count < expanded_candidate_limit as usize
+            {
+                return Ok(expanded_rows);
+            }
+        }
+
+        // Fast candidates were exhausted before we could satisfy the requested limit.
+        // Fall back to the original SQL shape to preserve exact behavior.
+        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
+        let fallback_sql = self.build_search_events_sql(
+            terms,
+            idf_by_term,
+            avgdl,
+            include_tool_events,
+            exclude_codex_mcp,
+            use_document_codex_flag,
+            session_id,
+            min_should_match,
+            min_score,
+            limit,
+        )?;
+
+        let mut fallback_rows: Vec<SearchRow> =
+            self.map_backend(self.ch.query_rows(&fallback_sql, None).await)?;
+        fallback_rows.sort_by(|a, b| b.score.total_cmp(&a.score));
+        Ok(fallback_rows)
+    }
+
+    async fn search_events_rows_fast_pass(
+        &self,
+        terms: &[String],
+        idf_by_term: &HashMap<String, f64>,
+        avgdl: f64,
+        include_tool_events: bool,
+        exclude_codex_mcp: bool,
+        session_id: Option<&str>,
+        min_should_match: u16,
+        min_score: f64,
+        limit: u16,
+        candidate_limit: u16,
+    ) -> RepoResult<(Vec<SearchRow>, usize)> {
+        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
+        let fast_sql = self.build_search_events_fast_candidates_sql(
+            terms,
+            idf_by_term,
+            avgdl,
+            include_tool_events,
+            exclude_codex_mcp,
+            session_id,
+            min_should_match,
+            min_score,
+            candidate_limit,
+            use_document_codex_flag,
+        )?;
+
+        let fast_candidates: Vec<SearchCandidateRow> =
+            self.map_backend(self.ch.query_rows(&fast_sql, None).await)?;
+        if fast_candidates.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let candidate_count = fast_candidates.len();
+        let mut fast_rows = Vec::<SearchRow>::new();
+        for row in fast_candidates {
+            if exclude_codex_mcp
+                && (row.has_codex_mcp != 0 || matches!(row.lower_name.as_str(), "search" | "open"))
+            {
+                continue;
+            }
+
+            fast_rows.push(SearchRow {
+                event_uid: row.event_uid,
+                session_id: row.session_id,
+                source_name: row.source_name,
+                provider: row.provider,
+                event_class: row.event_class,
+                payload_type: row.payload_type,
+                actor_role: row.actor_role,
+                name: row.name,
+                phase: row.phase,
+                source_ref: row.source_ref,
+                doc_len: row.doc_len,
+                text_preview: row.text_preview,
+                score: row.score,
+                matched_terms: row.matched_terms,
+            });
+
+            if fast_rows.len() >= limit as usize {
+                break;
+            }
+        }
+
+        Ok((fast_rows, candidate_count))
     }
 
     fn build_search_conversations_sql(
@@ -1169,10 +1761,12 @@ FORMAT JSONEachRow",
         let exclude_codex_mcp = query
             .exclude_codex_mcp
             .unwrap_or(self.cfg.default_exclude_codex_mcp);
+        let disable_cache = query.disable_cache.unwrap_or(false);
 
         if let Some(session_id) = query.session_id.as_deref() {
             Self::validate_session_id(session_id)?;
         }
+        let session_id = query.session_id.as_deref();
 
         let (docs, total_doc_len) = self.corpus_stats().await?;
         if docs == 0 {
@@ -1191,34 +1785,82 @@ FORMAT JSONEachRow",
         }
 
         let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
-        let df_map = self.df_map(&terms).await?;
+        let rows = if disable_cache {
+            let df_map = self.df_map(&terms).await?;
 
-        let mut idf_by_term = HashMap::<String, f64>::new();
-        for term in &terms {
-            let df = *df_map.get(term).unwrap_or(&0);
-            let idf = if df == 0 {
-                (1.0 + ((docs as f64 + 0.5) / 0.5)).ln()
+            let mut idf_by_term = HashMap::<String, f64>::new();
+            for term in &terms {
+                let df = *df_map.get(term).unwrap_or(&0);
+                let idf = if df == 0 {
+                    (1.0 + ((docs as f64 + 0.5) / 0.5)).ln()
+                } else {
+                    let n = docs.max(df) as f64;
+                    (1.0 + ((n - df as f64 + 0.5) / (df as f64 + 0.5))).ln()
+                };
+                idf_by_term.insert(term.clone(), idf.max(0.0));
+            }
+
+            self.search_events_rows(
+                &terms,
+                &idf_by_term,
+                avgdl,
+                include_tool_events,
+                exclude_codex_mcp,
+                session_id,
+                min_should_match,
+                min_score,
+                limit,
+            )
+            .await?
+        } else {
+            let index_watermark = self.search_index_watermark().await?;
+            let cache_key = Self::search_events_cache_key(
+                &terms,
+                docs,
+                total_doc_len,
+                &index_watermark,
+                include_tool_events,
+                exclude_codex_mcp,
+                session_id,
+                min_should_match,
+                min_score,
+                limit,
+            );
+
+            if let Some(cached_rows) = self.search_events_cache_get(&cache_key).await {
+                cached_rows
             } else {
-                let n = docs.max(df) as f64;
-                (1.0 + ((n - df as f64 + 0.5) / (df as f64 + 0.5))).ln()
-            };
-            idf_by_term.insert(term.clone(), idf.max(0.0));
-        }
+                let df_map = self.df_map(&terms).await?;
 
-        let sql = self.build_search_events_sql(
-            &terms,
-            &idf_by_term,
-            avgdl,
-            include_tool_events,
-            exclude_codex_mcp,
-            query.session_id.as_deref(),
-            min_should_match,
-            min_score,
-            limit,
-        )?;
+                let mut idf_by_term = HashMap::<String, f64>::new();
+                for term in &terms {
+                    let df = *df_map.get(term).unwrap_or(&0);
+                    let idf = if df == 0 {
+                        (1.0 + ((docs as f64 + 0.5) / 0.5)).ln()
+                    } else {
+                        let n = docs.max(df) as f64;
+                        (1.0 + ((n - df as f64 + 0.5) / (df as f64 + 0.5))).ln()
+                    };
+                    idf_by_term.insert(term.clone(), idf.max(0.0));
+                }
 
-        let mut rows: Vec<SearchRow> = self.map_backend(self.ch.query_rows(&sql, None).await)?;
-        rows.sort_by(|a, b| b.score.total_cmp(&a.score));
+                let fresh_rows = self
+                    .search_events_rows(
+                        &terms,
+                        &idf_by_term,
+                        avgdl,
+                        include_tool_events,
+                        exclude_codex_mcp,
+                        session_id,
+                        min_should_match,
+                        min_score,
+                        limit,
+                    )
+                    .await?;
+                self.search_events_cache_put(cache_key, &fresh_rows).await;
+                fresh_rows
+            }
+        };
 
         let took_ms = started.elapsed().as_millis() as u32;
 
@@ -1244,23 +1886,25 @@ FORMAT JSONEachRow",
             })
             .collect();
 
-        self.log_search_events(
-            &query_id,
-            source,
-            query_text,
-            query.session_id.as_deref().unwrap_or(""),
-            &terms,
-            limit,
-            min_should_match,
-            min_score,
-            include_tool_events,
-            exclude_codex_mcp,
-            took_ms,
-            &rows,
-            docs,
-            avgdl,
-        )
-        .await;
+        if source != BENCHMARK_REPLAY_SOURCE {
+            self.log_search_events(
+                &query_id,
+                source,
+                query_text,
+                session_id.unwrap_or(""),
+                &terms,
+                limit,
+                min_should_match,
+                min_score,
+                include_tool_events,
+                exclude_codex_mcp,
+                took_ms,
+                &rows,
+                docs,
+                avgdl,
+            )
+            .await;
+        }
 
         Ok(SearchEventsResult {
             query_id,

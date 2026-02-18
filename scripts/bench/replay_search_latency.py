@@ -11,6 +11,7 @@ import argparse
 import base64
 import json
 import math
+import random
 import re
 import shutil
 import subprocess
@@ -27,6 +28,7 @@ from urllib.request import Request, urlopen
 WINDOW_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
 SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 BENCHMARK_REPLAY_SOURCE = "benchmark-replay"
+QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
 @dataclass
@@ -41,6 +43,8 @@ class ClickHouseSettings:
 @dataclass
 class ReplaySpec:
     rank: int
+    variant_label: str
+    variant_term_count: int
     ts: str
     query_id: str
     source: str
@@ -111,6 +115,26 @@ def parse_args() -> argparse.Namespace:
         "--include-benchmark-replays",
         action="store_true",
         help=f"Include rows with source='{BENCHMARK_REPLAY_SOURCE}' in top-N selection",
+    )
+    parser.add_argument(
+        "--query-variant-mode",
+        choices=["none", "subset_scramble"],
+        default="subset_scramble",
+        help=(
+            "How replay queries are expanded before benchmarking. "
+            "'subset_scramble' runs one deterministic scrambled variant for each k=1..N terms."
+        ),
+    )
+    parser.add_argument(
+        "--max-query-terms",
+        type=positive_int,
+        default=32,
+        help="Max normalized query terms to consider for subset/scramble expansion",
+    )
+    parser.add_argument(
+        "--use-search-cache",
+        action="store_true",
+        help="Allow moraine-conversations search result cache during replay (default: disabled)",
     )
     parser.add_argument("--output-json", help="Write machine-readable results JSON to this path")
     parser.add_argument(
@@ -448,6 +472,8 @@ def normalize_rows(raw_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
             replayable.append(
                 ReplaySpec(
                     rank=rank,
+                    variant_label="orig",
+                    variant_term_count=0,
                     ts=entry["ts"],
                     query_id=entry["query_id"],
                     source=entry["source"],
@@ -463,6 +489,85 @@ def normalize_rows(raw_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
         selected.append(entry)
 
     return selected, replayable
+
+
+def tokenize_query_terms(text: str, max_terms: int) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for mat in QUERY_TOKEN_RE.finditer(text):
+        token = mat.group(0).lower()
+        if len(token) < 2 or len(token) > 64:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+        if len(terms) >= max_terms:
+            break
+    return terms
+
+
+def expand_replay_specs(
+    specs: list[ReplaySpec],
+    query_variant_mode: str,
+    max_query_terms: int,
+) -> list[ReplaySpec]:
+    expanded: list[ReplaySpec] = []
+    for spec in specs:
+        base_terms = tokenize_query_terms(spec.raw_query, max_query_terms)
+        base = ReplaySpec(
+            rank=spec.rank,
+            variant_label="orig",
+            variant_term_count=len(base_terms),
+            ts=spec.ts,
+            query_id=spec.query_id,
+            source=spec.source,
+            session_hint=spec.session_hint,
+            raw_query=spec.raw_query,
+            baseline_response_ms=spec.baseline_response_ms,
+            arguments=dict(spec.arguments),
+        )
+        expanded.append(base)
+
+        if query_variant_mode != "subset_scramble" or not base_terms:
+            continue
+
+        seen_queries: set[str] = {collapse_whitespace(base.raw_query).lower()}
+        for term_count in range(1, len(base_terms) + 1):
+            rng = random.Random(
+                f"{spec.rank}:{spec.query_id}:{spec.raw_query}:{term_count}:{max_query_terms}"
+            )
+            chosen_terms = rng.sample(base_terms, term_count)
+            rng.shuffle(chosen_terms)
+            variant_query = " ".join(chosen_terms)
+
+            normalized = collapse_whitespace(variant_query).lower()
+            if normalized in seen_queries:
+                continue
+            seen_queries.add(normalized)
+
+            variant_args = dict(base.arguments)
+            variant_args["query"] = variant_query
+            variant_args["min_should_match"] = max(
+                1, min(int(variant_args["min_should_match"]), term_count)
+            )
+
+            expanded.append(
+                ReplaySpec(
+                    rank=spec.rank,
+                    variant_label=f"k={term_count}",
+                    variant_term_count=term_count,
+                    ts=spec.ts,
+                    query_id=spec.query_id,
+                    source=spec.source,
+                    session_hint=spec.session_hint,
+                    raw_query=variant_query,
+                    baseline_response_ms=spec.baseline_response_ms,
+                    arguments=variant_args,
+                )
+            )
+
+    return expanded
 
 
 def percentile(values: list[float], q: float) -> Optional[float]:
@@ -557,6 +662,7 @@ class PackageSearchClient:
         conversation_client_cls: Any,
         clickhouse: ClickHouseSettings,
         timeout_seconds: int,
+        disable_cache: bool,
     ) -> None:
         self.client = conversation_client_cls(
             url=clickhouse.url,
@@ -566,6 +672,7 @@ class PackageSearchClient:
             timeout_seconds=float(timeout_seconds),
             max_results=65535,
         )
+        self.disable_cache = disable_cache
 
     def search(self, arguments: dict[str, Any]) -> dict[str, Any]:
         payload = self.client.search_events_json(
@@ -576,6 +683,7 @@ class PackageSearchClient:
             min_should_match=int(arguments["min_should_match"]),
             include_tool_events=bool(arguments["include_tool_events"]),
             exclude_codex_mcp=bool(arguments["exclude_codex_mcp"]),
+            disable_cache=self.disable_cache,
             source=BENCHMARK_REPLAY_SOURCE,
         )
         parsed = json.loads(payload)
@@ -598,21 +706,26 @@ def classify_failure(exc: Exception) -> str:
 def print_selection_summary(
     args: argparse.Namespace,
     selected_rows: list[dict[str, Any]],
-    replayable_rows: list[ReplaySpec],
+    base_replay_rows: list[ReplaySpec],
+    expanded_replay_rows: list[ReplaySpec],
 ) -> None:
     ts_values = [row.get("ts", "") for row in selected_rows if row.get("ts")]
     window_range = "-"
     if ts_values:
         window_range = f"{min(ts_values)} .. {max(ts_values)}"
 
-    skipped = len(selected_rows) - len(replayable_rows)
+    skipped = len(selected_rows) - len(base_replay_rows)
     print("Selection")
     print(f"  window: {args.window}")
     print(f"  requested_top_n: {args.top_n}")
     print(f"  include_benchmark_replays: {args.include_benchmark_replays}")
     print(f"  selected_rows: {len(selected_rows)}")
-    print(f"  replayable_rows: {len(replayable_rows)}")
+    print(f"  replayable_rows: {len(base_replay_rows)}")
     print(f"  skipped_rows: {skipped}")
+    print(f"  query_variant_mode: {args.query_variant_mode}")
+    print(f"  max_query_terms: {args.max_query_terms}")
+    print(f"  expanded_replay_cases: {len(expanded_replay_rows)}")
+    print(f"  use_search_cache: {args.use_search_cache}")
     print(f"  selected_ts_range: {window_range}")
 
 
@@ -651,8 +764,8 @@ def print_dry_run_table(selected_rows: list[dict[str, Any]]) -> None:
 def print_replay_table(results: list[dict[str, Any]]) -> None:
     print("\nPer-Query Replay")
     header = (
-        f"{'rank':>4} {'baseline':>9} {'p50':>8} {'p95':>8} {'delta_p50':>10} "
-        f"{'min':>8} {'max':>8} {'ok':>5} {'fail':>5}  query"
+        f"{'rank':>4} {'case':>7} {'terms':>5} {'baseline':>9} {'p50':>8} {'p95':>8} "
+        f"{'delta_p50':>10} {'min':>8} {'max':>8} {'ok':>5} {'fail':>5}  query"
     )
     print(header)
     print("-" * len(header))
@@ -660,6 +773,8 @@ def print_replay_table(results: list[dict[str, Any]]) -> None:
         stats = result.get("stats_ms") or {}
         line = (
             f"{result['rank']:>4} "
+            f"{str(result.get('variant_label', 'orig')):>7} "
+            f"{str(result.get('variant_term_count', '-')):>5} "
             f"{result['baseline_response_ms']:>9.2f} "
             f"{format_optional_ms(stats.get('p50')):>8} "
             f"{format_optional_ms(stats.get('p95')):>8} "
@@ -696,6 +811,9 @@ def build_output_json(
                 "dry_run": dry_run,
                 "skip_maturin_develop": args.skip_maturin_develop,
                 "include_benchmark_replays": args.include_benchmark_replays,
+                "query_variant_mode": args.query_variant_mode,
+                "max_query_terms": args.max_query_terms,
+                "use_search_cache": args.use_search_cache,
             },
             "selected_count": len(selected_rows),
             "replayed_count": len(replay_results),
@@ -761,8 +879,13 @@ def main() -> int:
             write_output_json(Path(args.output_json).expanduser(), empty_payload)
         return 2
 
-    selected_rows, replayable_rows = normalize_rows(raw_rows)
-    print_selection_summary(args, selected_rows, replayable_rows)
+    selected_rows, base_replay_rows = normalize_rows(raw_rows)
+    replayable_rows = expand_replay_specs(
+        base_replay_rows,
+        query_variant_mode=args.query_variant_mode,
+        max_query_terms=args.max_query_terms,
+    )
+    print_selection_summary(args, selected_rows, base_replay_rows, replayable_rows)
 
     if args.dry_run:
         print_dry_run_table(selected_rows)
@@ -779,7 +902,7 @@ def main() -> int:
             write_output_json(Path(args.output_json).expanduser(), payload)
         return 0
 
-    if not replayable_rows:
+    if not base_replay_rows:
         print(
             "fatal: selected rows were present but none were valid for replay",
             file=sys.stderr,
@@ -814,6 +937,7 @@ def main() -> int:
             conversation_client_cls=conversation_client_cls,
             clickhouse=ch_cfg,
             timeout_seconds=args.timeout_seconds,
+            disable_cache=not args.use_search_cache,
         )
     except Exception as exc:
         print(f"fatal: failed to initialize local search client: {exc}", file=sys.stderr)
@@ -873,6 +997,8 @@ def main() -> int:
         replay_results.append(
             {
                 "rank": spec.rank,
+                "variant_label": spec.variant_label,
+                "variant_term_count": spec.variant_term_count,
                 "ts": spec.ts,
                 "query_id": spec.query_id,
                 "source": spec.source,
