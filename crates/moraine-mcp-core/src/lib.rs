@@ -382,6 +382,7 @@ impl AppState {
                 include_tool_events: args.include_tool_events,
                 exclude_codex_mcp: args.exclude_codex_mcp,
                 disable_cache: None,
+                search_strategy: None,
             })
             .await
             .map_err(|err| anyhow!(err.to_string()))?;

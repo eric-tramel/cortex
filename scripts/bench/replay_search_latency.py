@@ -123,6 +123,13 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
+def ratio_0_to_1(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0.0 or parsed > 1.0:
+        raise argparse.ArgumentTypeError("value must be in [0.0, 1.0]")
+    return parsed
+
+
 def parse_window_interval(value: str) -> str:
     match = WINDOW_RE.match(value)
     if not match:
@@ -197,6 +204,54 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Parse each search_events_json payload with json.loads during measured runs "
             "(default: disabled to minimize benchmark-side JSON decode overhead)"
+        ),
+    )
+    parser.add_argument(
+        "--oracle-quality-check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Compare replay results against oracle_exact SQL search and report "
+            "quality regression metrics (enabled by default)"
+        ),
+    )
+    parser.add_argument(
+        "--oracle-k",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "Top-K used for oracle quality metrics. "
+            "Use 0 (default) to use each query's replay limit."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-recall-at-k-threshold",
+        type=ratio_0_to_1,
+        default=1.0,
+        help="Minimum Recall@K gate against oracle results",
+    )
+    parser.add_argument(
+        "--oracle-ndcg-at-k-threshold",
+        type=ratio_0_to_1,
+        default=0.99,
+        help="Minimum NDCG@K gate against oracle results",
+    )
+    parser.add_argument(
+        "--oracle-min-stability-recall",
+        type=ratio_0_to_1,
+        default=0.95,
+        help=(
+            "Minimum oracle-vs-oracle Recall@K stability required for strict gating. "
+            "Below this, the case is treated as unstable and excluded from regressions."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-min-stability-ndcg",
+        type=ratio_0_to_1,
+        default=0.98,
+        help=(
+            "Minimum oracle-vs-oracle NDCG@K stability required for strict gating. "
+            "Below this, the case is treated as unstable and excluded from regressions."
         ),
     )
     parser.add_argument("--output-json", help="Write machine-readable results JSON to this path")
@@ -677,6 +732,288 @@ def summarize_values(values: list[float], include_p99: bool) -> Optional[dict[st
     return stats
 
 
+def parse_search_payload(payload: str) -> dict[str, Any]:
+    parsed = json.loads(payload)
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"search_events_json returned non-object payload: {type(parsed).__name__}"
+        )
+    return parsed
+
+
+def top_ranked_event_uids(payload: dict[str, Any], top_k: int) -> list[str]:
+    if top_k <= 0:
+        return []
+    hits = payload.get("hits")
+    if not isinstance(hits, list):
+        return []
+
+    ranked: list[str] = []
+    seen: set[str] = set()
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        event_uid = hit.get("event_uid")
+        if not isinstance(event_uid, str):
+            continue
+        event_uid = event_uid.strip()
+        if not event_uid or event_uid in seen:
+            continue
+        ranked.append(event_uid)
+        seen.add(event_uid)
+        if len(ranked) >= top_k:
+            break
+    return ranked
+
+
+def dcg(scores: list[float]) -> float:
+    total = 0.0
+    for idx, score in enumerate(scores):
+        if score <= 0.0:
+            continue
+        total += score / math.log2(idx + 2.0)
+    return total
+
+
+def quality_metrics_for_candidate(
+    candidate_payload: dict[str, Any],
+    reference_payload: dict[str, Any],
+    top_k: int,
+) -> dict[str, Any]:
+    reference_ranked = top_ranked_event_uids(reference_payload, top_k)
+    candidate_ranked = top_ranked_event_uids(candidate_payload, top_k)
+
+    reference_set = set(reference_ranked)
+    candidate_set = set(candidate_ranked)
+
+    if not reference_set:
+        recall_at_k = 1.0
+    else:
+        recall_at_k = len(reference_set.intersection(candidate_set)) / float(len(reference_set))
+
+    # Rank-sensitive gain model: earlier reference ranks receive higher gain.
+    reference_gain_by_uid = {
+        event_uid: float(top_k - rank_idx)
+        for rank_idx, event_uid in enumerate(reference_ranked)
+        if rank_idx < top_k
+    }
+    candidate_gains = [reference_gain_by_uid.get(event_uid, 0.0) for event_uid in candidate_ranked]
+    ideal_gains = sorted(reference_gain_by_uid.values(), reverse=True)
+    idcg = dcg(ideal_gains)
+    ndcg_at_k = 1.0 if idcg == 0.0 else dcg(candidate_gains) / idcg
+
+    missing_from_candidate = [uid for uid in reference_ranked if uid not in candidate_set]
+    unexpected_in_candidate = [uid for uid in candidate_ranked if uid not in reference_set]
+
+    return {
+        "k": top_k,
+        "candidate_top_event_uids": candidate_ranked,
+        "reference_top_event_uids": reference_ranked,
+        "candidate_top_count": len(candidate_ranked),
+        "reference_top_count": len(reference_ranked),
+        "missing_from_candidate_top_k": missing_from_candidate,
+        "unexpected_in_candidate_top_k": unexpected_in_candidate,
+        "recall_at_k": recall_at_k,
+        "ndcg_at_k": ndcg_at_k,
+    }
+
+
+def evaluate_oracle_quality(
+    optimized_payload: dict[str, Any],
+    oracle_payload: dict[str, Any],
+    top_k: int,
+    recall_threshold: float,
+    ndcg_threshold: float,
+    min_stability_recall: float,
+    min_stability_ndcg: float,
+    oracle_recheck_payloads: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    oracle_snapshots = [oracle_payload]
+    if oracle_recheck_payloads:
+        oracle_snapshots.extend(oracle_recheck_payloads)
+
+    optimized_metrics_by_snapshot: list[tuple[str, dict[str, Any]]] = []
+    for idx, snapshot in enumerate(oracle_snapshots):
+        label = "primary" if idx == 0 else f"recheck_{idx}"
+        metrics = quality_metrics_for_candidate(
+            candidate_payload=optimized_payload,
+            reference_payload=snapshot,
+            top_k=top_k,
+        )
+        optimized_metrics_by_snapshot.append((label, metrics))
+
+    oracle_reference_label, optimized_vs_oracle = max(
+        optimized_metrics_by_snapshot,
+        key=lambda item: (item[1]["recall_at_k"], item[1]["ndcg_at_k"]),
+    )
+
+    effective_recall_threshold = recall_threshold
+    effective_ndcg_threshold = ndcg_threshold
+    oracle_stability: Optional[dict[str, Any]] = None
+    unstable_oracle_window = False
+    unstable_reasons: list[str] = []
+
+    if len(oracle_snapshots) > 1:
+        min_pair_recall = 1.0
+        min_pair_ndcg = 1.0
+        worst_pair: Optional[tuple[int, int]] = None
+        worst_pair_detail: Optional[dict[str, Any]] = None
+
+        for left_idx in range(len(oracle_snapshots)):
+            for right_idx in range(left_idx + 1, len(oracle_snapshots)):
+                left = oracle_snapshots[left_idx]
+                right = oracle_snapshots[right_idx]
+                right_vs_left = quality_metrics_for_candidate(
+                    candidate_payload=right,
+                    reference_payload=left,
+                    top_k=top_k,
+                )
+                left_vs_right = quality_metrics_for_candidate(
+                    candidate_payload=left,
+                    reference_payload=right,
+                    top_k=top_k,
+                )
+
+                pair_recall = min(
+                    right_vs_left["recall_at_k"],
+                    left_vs_right["recall_at_k"],
+                )
+                pair_ndcg = min(
+                    right_vs_left["ndcg_at_k"],
+                    left_vs_right["ndcg_at_k"],
+                )
+
+                if (pair_recall, pair_ndcg) < (min_pair_recall, min_pair_ndcg):
+                    min_pair_recall = pair_recall
+                    min_pair_ndcg = pair_ndcg
+                    worst_pair = (left_idx, right_idx)
+                    worst_pair_detail = {
+                        "left_to_right": left_vs_right,
+                        "right_to_left": right_vs_left,
+                    }
+
+        effective_recall_threshold = min(recall_threshold, min_pair_recall)
+        effective_ndcg_threshold = min(ndcg_threshold, min_pair_ndcg)
+        oracle_stability = {
+            "snapshot_count": len(oracle_snapshots),
+            "worst_pair": {
+                "left_index": worst_pair[0] if worst_pair is not None else 0,
+                "right_index": worst_pair[1] if worst_pair is not None else 0,
+            },
+            "worst_pair_detail": worst_pair_detail,
+            "recall_at_k": min_pair_recall,
+            "ndcg_at_k": min_pair_ndcg,
+        }
+
+        if min_pair_recall < min_stability_recall:
+            unstable_oracle_window = True
+            unstable_reasons.append(
+                f"oracle_recall_at_k<{min_stability_recall:.3f}"
+            )
+        if min_pair_ndcg < min_stability_ndcg:
+            unstable_oracle_window = True
+            unstable_reasons.append(
+                f"oracle_ndcg_at_k<{min_stability_ndcg:.3f}"
+            )
+
+    passes_gate = (
+        optimized_vs_oracle["recall_at_k"] >= effective_recall_threshold
+        and optimized_vs_oracle["ndcg_at_k"] >= effective_ndcg_threshold
+    )
+    if unstable_oracle_window:
+        passes_gate = True
+
+    return {
+        "enabled": True,
+        "status": "ok",
+        "k": top_k,
+        "oracle_reference": oracle_reference_label,
+        "optimized_top_event_uids": optimized_vs_oracle["candidate_top_event_uids"],
+        "oracle_top_event_uids": optimized_vs_oracle["reference_top_event_uids"],
+        "optimized_top_count": optimized_vs_oracle["candidate_top_count"],
+        "oracle_top_count": optimized_vs_oracle["reference_top_count"],
+        "missing_from_optimized_top_k": optimized_vs_oracle["missing_from_candidate_top_k"],
+        "unexpected_in_optimized_top_k": optimized_vs_oracle["unexpected_in_candidate_top_k"],
+        "recall_at_k": optimized_vs_oracle["recall_at_k"],
+        "ndcg_at_k": optimized_vs_oracle["ndcg_at_k"],
+        "thresholds": {
+            "recall_at_k": recall_threshold,
+            "ndcg_at_k": ndcg_threshold,
+        },
+        "effective_thresholds": {
+            "recall_at_k": effective_recall_threshold,
+            "ndcg_at_k": effective_ndcg_threshold,
+        },
+        "oracle_stability": oracle_stability,
+        "unstable_oracle_window": unstable_oracle_window,
+        "unstable_reasons": unstable_reasons,
+        "passes_gate": passes_gate,
+    }
+
+
+def summarize_oracle_quality(
+    replay_results: list[dict[str, Any]],
+    recall_threshold: float,
+    ndcg_threshold: float,
+) -> dict[str, Any]:
+    quality_items: list[dict[str, Any]] = []
+    for row in replay_results:
+        quality = row.get("oracle_quality")
+        if isinstance(quality, dict) and quality.get("enabled", False):
+            quality_items.append(quality)
+
+    if not quality_items:
+        return {
+            "enabled": False,
+            "thresholds": {
+                "recall_at_k": recall_threshold,
+                "ndcg_at_k": ndcg_threshold,
+            },
+            "evaluated_case_count": 0,
+            "unstable_case_count": 0,
+            "error_count": 0,
+            "pass_count": 0,
+            "regression_count": 0,
+            "pass_rate": None,
+            "recall_at_k": None,
+            "ndcg_at_k": None,
+            "k_values": [],
+        }
+
+    ok_items = [item for item in quality_items if item.get("status") == "ok"]
+    error_items = [item for item in quality_items if item.get("status") == "error"]
+    unstable_items = [item for item in ok_items if item.get("unstable_oracle_window", False)]
+    stable_items = [item for item in ok_items if not item.get("unstable_oracle_window", False)]
+    regression_count = sum(1 for item in stable_items if not item.get("passes_gate", False))
+    pass_count = len(stable_items) - regression_count
+    pass_rate = None
+    if stable_items:
+        pass_rate = pass_count / float(len(stable_items))
+
+    recall_values = [float(item["recall_at_k"]) for item in stable_items]
+    ndcg_values = [float(item["ndcg_at_k"]) for item in stable_items]
+    k_values = sorted(
+        {int(item.get("k", 0)) for item in stable_items if int(item.get("k", 0)) > 0}
+    )
+
+    return {
+        "enabled": True,
+        "thresholds": {
+            "recall_at_k": recall_threshold,
+            "ndcg_at_k": ndcg_threshold,
+        },
+        "evaluated_case_count": len(stable_items),
+        "unstable_case_count": len(unstable_items),
+        "error_count": len(error_items),
+        "pass_count": pass_count,
+        "regression_count": regression_count,
+        "pass_rate": pass_rate,
+        "recall_at_k": summarize_values(recall_values, include_p99=False),
+        "ndcg_at_k": summarize_values(ndcg_values, include_p99=False),
+        "k_values": k_values,
+    }
+
+
 def ensure_local_python_binding(repo_root: Path) -> None:
     manifest_path = repo_root / "bindings" / "python" / "moraine_conversations" / "Cargo.toml"
     if not manifest_path.exists():
@@ -753,8 +1090,17 @@ class PackageSearchClient:
         self.disable_cache = disable_cache
         self.parse_json_response = parse_json_response
 
-    def search(self, arguments: dict[str, Any]) -> Optional[dict[str, Any]]:
-        payload = self.client.search_events_json(
+    def search_payload(
+        self,
+        arguments: dict[str, Any],
+        *,
+        search_strategy: str = "optimized",
+        disable_cache_override: Optional[bool] = None,
+    ) -> str:
+        disable_cache = (
+            self.disable_cache if disable_cache_override is None else disable_cache_override
+        )
+        return self.client.search_events_json(
             query=str(arguments["query"]),
             limit=int(arguments["limit"]),
             session_id=arguments.get("session_id"),
@@ -762,18 +1108,17 @@ class PackageSearchClient:
             min_should_match=int(arguments["min_should_match"]),
             include_tool_events=bool(arguments["include_tool_events"]),
             exclude_codex_mcp=bool(arguments["exclude_codex_mcp"]),
-            disable_cache=self.disable_cache,
+            disable_cache=disable_cache,
             source=BENCHMARK_REPLAY_SOURCE,
+            search_strategy=search_strategy,
         )
+
+    def search(self, arguments: dict[str, Any]) -> Optional[dict[str, Any]]:
+        payload = self.search_payload(arguments, search_strategy="optimized")
         if not self.parse_json_response:
             return None
 
-        parsed = json.loads(payload)
-        if not isinstance(parsed, dict):
-            raise RuntimeError(
-                f"search_events_json returned non-object payload: {type(parsed).__name__}"
-            )
-        return parsed
+        return parse_search_payload(payload)
 
 
 def classify_failure(exc: Exception) -> str:
@@ -809,6 +1154,14 @@ def print_selection_summary(
     print(f"  expanded_replay_cases: {len(expanded_replay_rows)}")
     print(f"  use_search_cache: {args.use_search_cache}")
     print(f"  parse_json_response: {args.parse_json_response}")
+    print(f"  oracle_quality_check: {args.oracle_quality_check}")
+    if args.oracle_quality_check:
+        oracle_k = args.oracle_k if args.oracle_k > 0 else "query_limit"
+        print(f"  oracle_k: {oracle_k}")
+        print(f"  oracle_recall_at_k_threshold: {args.oracle_recall_at_k_threshold:.3f}")
+        print(f"  oracle_ndcg_at_k_threshold: {args.oracle_ndcg_at_k_threshold:.3f}")
+        print(f"  oracle_min_stability_recall: {args.oracle_min_stability_recall:.3f}")
+        print(f"  oracle_min_stability_ndcg: {args.oracle_min_stability_ndcg:.3f}")
     print(f"  selected_ts_range: {window_range}")
 
 
@@ -849,7 +1202,7 @@ def print_replay_table(results: list[dict[str, Any]]) -> None:
     header = (
         f"{'rank':>4} {'case':>7} {'terms':>5} {'baseline':>9} {'p50':>8} {'p95':>8} "
         f"{'delta_p50':>10} {'min':>8} {'max':>8} {'rss+p50MiB':>10} {'peak+maxMiB':>12} "
-        f"{'ok':>5} {'fail':>5}  query"
+        f"{'q_rec':>7} {'q_ndcg':>7} {'q_ok':>5} {'ok':>5} {'fail':>5}  query"
     )
     print(header)
     print("-" * len(header))
@@ -858,6 +1211,20 @@ def print_replay_table(results: list[dict[str, Any]]) -> None:
         memory_stats = result.get("memory_stats_mib") or {}
         rss_growth_stats = memory_stats.get("rss_growth") or {}
         peak_delta_stats = memory_stats.get("peak_delta") or {}
+        quality = result.get("oracle_quality") or {}
+        quality_status = quality.get("status")
+        if quality_status == "ok":
+            quality_recall = f"{quality.get('recall_at_k', 0.0):.3f}"
+            quality_ndcg = f"{quality.get('ndcg_at_k', 0.0):.3f}"
+            quality_ok = "yes" if quality.get("passes_gate") else "no"
+        elif quality_status == "error":
+            quality_recall = "error"
+            quality_ndcg = "error"
+            quality_ok = "no"
+        else:
+            quality_recall = "-"
+            quality_ndcg = "-"
+            quality_ok = "-"
         line = (
             f"{result['rank']:>4} "
             f"{str(result.get('variant_label', 'orig')):>7} "
@@ -870,11 +1237,70 @@ def print_replay_table(results: list[dict[str, Any]]) -> None:
             f"{format_optional_ms(stats.get('max')):>8} "
             f"{format_optional_ms(rss_growth_stats.get('p50')):>10} "
             f"{format_optional_ms(peak_delta_stats.get('max')):>12} "
+            f"{quality_recall:>7} "
+            f"{quality_ndcg:>7} "
+            f"{quality_ok:>5} "
             f"{result['success_count']:>5} "
             f"{result['failure_count']:>5}  "
             f"{preview_query(result['query'])}"
         )
         print(line)
+
+
+def print_oracle_quality_summary(quality: dict[str, Any]) -> None:
+    print("\nOracle Quality")
+    if not quality.get("enabled"):
+        print("  enabled: false")
+        return
+
+    print("  enabled: true")
+    print(
+        "  thresholds: "
+        f"recall_at_k>={quality['thresholds']['recall_at_k']:.3f} "
+        f"ndcg_at_k>={quality['thresholds']['ndcg_at_k']:.3f}"
+    )
+    print(f"  evaluated_case_count: {quality['evaluated_case_count']}")
+    print(f"  unstable_case_count: {quality.get('unstable_case_count', 0)}")
+    print(f"  pass_count: {quality['pass_count']}")
+    print(f"  regression_count: {quality['regression_count']}")
+    print(f"  error_count: {quality['error_count']}")
+
+    if quality.get("pass_rate") is None:
+        print("  pass_rate: -")
+    else:
+        print(f"  pass_rate: {quality['pass_rate']:.3f}")
+
+    k_values = quality.get("k_values") or []
+    if k_values:
+        print(f"  k_values: {','.join(str(value) for value in k_values)}")
+    else:
+        print("  k_values: -")
+
+    recall_stats = quality.get("recall_at_k")
+    if recall_stats is None:
+        print("  recall_at_k: -")
+    else:
+        print(
+            "  recall_at_k: "
+            f"min={recall_stats['min']:.3f} "
+            f"p50={recall_stats['p50']:.3f} "
+            f"p95={recall_stats['p95']:.3f} "
+            f"max={recall_stats['max']:.3f} "
+            f"avg={recall_stats['avg']:.3f}"
+        )
+
+    ndcg_stats = quality.get("ndcg_at_k")
+    if ndcg_stats is None:
+        print("  ndcg_at_k: -")
+    else:
+        print(
+            "  ndcg_at_k: "
+            f"min={ndcg_stats['min']:.3f} "
+            f"p50={ndcg_stats['p50']:.3f} "
+            f"p95={ndcg_stats['p95']:.3f} "
+            f"max={ndcg_stats['max']:.3f} "
+            f"avg={ndcg_stats['avg']:.3f}"
+        )
 
 
 def build_output_json(
@@ -904,6 +1330,12 @@ def build_output_json(
                 "max_query_terms": args.max_query_terms,
                 "use_search_cache": args.use_search_cache,
                 "parse_json_response": args.parse_json_response,
+                "oracle_quality_check": args.oracle_quality_check,
+                "oracle_k": args.oracle_k,
+                "oracle_recall_at_k_threshold": args.oracle_recall_at_k_threshold,
+                "oracle_ndcg_at_k_threshold": args.oracle_ndcg_at_k_threshold,
+                "oracle_min_stability_recall": args.oracle_min_stability_recall,
+                "oracle_min_stability_ndcg": args.oracle_min_stability_ndcg,
             },
             "selected_count": len(selected_rows),
             "replayed_count": len(replay_results),
@@ -961,7 +1393,12 @@ def main() -> int:
             config_path=config_path,
             selected_rows=[],
             replay_results=[],
-            aggregate={"stats_ms": None, "successful_samples": 0, "memory": None},
+            aggregate={
+                "stats_ms": None,
+                "successful_samples": 0,
+                "memory": None,
+                "quality": None,
+            },
             failures={"timeouts": 0, "errors": 1},
             dry_run=args.dry_run,
         )
@@ -984,7 +1421,12 @@ def main() -> int:
             config_path=config_path,
             selected_rows=selected_rows,
             replay_results=[],
-            aggregate={"stats_ms": None, "successful_samples": 0, "memory": None},
+            aggregate={
+                "stats_ms": None,
+                "successful_samples": 0,
+                "memory": None,
+                "quality": None,
+            },
             failures={"timeouts": 0, "errors": 0},
             dry_run=True,
         )
@@ -1002,7 +1444,12 @@ def main() -> int:
             config_path=config_path,
             selected_rows=selected_rows,
             replay_results=[],
-            aggregate={"stats_ms": None, "successful_samples": 0, "memory": None},
+            aggregate={
+                "stats_ms": None,
+                "successful_samples": 0,
+                "memory": None,
+                "quality": None,
+            },
             failures={"timeouts": 0, "errors": 1},
             dry_run=False,
         )
@@ -1107,6 +1554,55 @@ def main() -> int:
             all_rss_growth_bytes.extend(measured_rss_growth_bytes)
             all_peak_delta_bytes.extend(measured_peak_delta_bytes)
 
+        oracle_quality: dict[str, Any] = {"enabled": False, "status": "disabled"}
+        if args.oracle_quality_check:
+            top_k = args.oracle_k if args.oracle_k > 0 else int(spec.arguments["limit"])
+            top_k = max(1, top_k)
+            try:
+                oracle_payload_primary = client.search_payload(
+                    spec.arguments,
+                    search_strategy="oracle_exact",
+                    disable_cache_override=True,
+                )
+                optimized_payload = client.search_payload(
+                    spec.arguments,
+                    search_strategy="optimized",
+                )
+                oracle_payload_recheck = client.search_payload(
+                    spec.arguments,
+                    search_strategy="oracle_exact",
+                    disable_cache_override=True,
+                )
+                oracle_payload_recheck_2 = client.search_payload(
+                    spec.arguments,
+                    search_strategy="oracle_exact",
+                    disable_cache_override=True,
+                )
+                oracle_quality = evaluate_oracle_quality(
+                    optimized_payload=parse_search_payload(optimized_payload),
+                    oracle_payload=parse_search_payload(oracle_payload_primary),
+                    top_k=top_k,
+                    recall_threshold=args.oracle_recall_at_k_threshold,
+                    ndcg_threshold=args.oracle_ndcg_at_k_threshold,
+                    min_stability_recall=args.oracle_min_stability_recall,
+                    min_stability_ndcg=args.oracle_min_stability_ndcg,
+                    oracle_recheck_payloads=[
+                        parse_search_payload(oracle_payload_recheck),
+                        parse_search_payload(oracle_payload_recheck_2),
+                    ],
+                )
+            except Exception as exc:
+                oracle_quality = {
+                    "enabled": True,
+                    "status": "error",
+                    "k": top_k,
+                    "message": str(exc),
+                    "thresholds": {
+                        "recall_at_k": args.oracle_recall_at_k_threshold,
+                        "ndcg_at_k": args.oracle_ndcg_at_k_threshold,
+                    },
+                }
+
         replay_results.append(
             {
                 "rank": spec.rank,
@@ -1131,6 +1627,7 @@ def main() -> int:
                 "success_count": len(measured_samples),
                 "failure_count": len(query_failures),
                 "failures": query_failures,
+                "oracle_quality": oracle_quality,
             }
         )
 
@@ -1175,12 +1672,26 @@ def main() -> int:
         "query_peak_delta_mib": summarize_bytes_as_mib(all_peak_delta_bytes, include_p99=True),
     }
 
-    failure_total = failures["timeouts"] + failures["errors"]
+    runtime_failure_total = failures["timeouts"] + failures["errors"]
+    quality_summary = summarize_oracle_quality(
+        replay_results=replay_results,
+        recall_threshold=args.oracle_recall_at_k_threshold,
+        ndcg_threshold=args.oracle_ndcg_at_k_threshold,
+    )
+    quality_failure_total = 0
+    if quality_summary.get("enabled", False):
+        quality_failure_total = int(quality_summary["regression_count"]) + int(
+            quality_summary["error_count"]
+        )
+    failure_total = runtime_failure_total + quality_failure_total
 
     aggregate = {
         "successful_samples": len(all_samples),
         "stats_ms": aggregate_stats,
         "memory": aggregate_memory,
+        "quality": quality_summary,
+        "runtime_failure_total": runtime_failure_total,
+        "quality_failure_total": quality_failure_total,
         "failure_total": failure_total,
         "timeout_count": failures["timeouts"],
         "error_count": failures["errors"],
@@ -1258,6 +1769,11 @@ def main() -> int:
             f"avg={query_peak_delta_mib['avg']:.2f}"
         )
 
+    print_oracle_quality_summary(quality_summary)
+
+    if quality_summary.get("enabled", False):
+        print(f"  quality_failure_total: {quality_failure_total}")
+
     payload = build_output_json(
         args=args,
         config_path=config_path,
@@ -1270,11 +1786,20 @@ def main() -> int:
     if args.output_json:
         write_output_json(Path(args.output_json).expanduser(), payload)
 
-    if failure_total > 0:
-        print(
-            "benchmark completed with replay failures/timeouts; see per-query failure details",
-            file=sys.stderr,
-        )
+    if runtime_failure_total > 0 or quality_failure_total > 0:
+        if runtime_failure_total > 0 and quality_failure_total > 0:
+            message = (
+                "benchmark completed with replay failures/timeouts and oracle quality "
+                "regressions/errors; see per-query failure details"
+            )
+        elif runtime_failure_total > 0:
+            message = "benchmark completed with replay failures/timeouts; see per-query failure details"
+        else:
+            message = (
+                "benchmark completed with oracle quality regressions/errors; "
+                "see per-query quality details"
+            )
+        print(message, file=sys.stderr)
         return 1
     return 0
 

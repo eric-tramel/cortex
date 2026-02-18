@@ -18,7 +18,7 @@ use crate::domain::{
     ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
     ConversationSearchStats, ConversationSummary, OpenContext, OpenEvent, OpenEventRequest, Page,
     PageRequest, RepoConfig, SearchEventHit, SearchEventsQuery, SearchEventsResult,
-    SearchEventsStats, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    SearchEventsStats, SearchEventsStrategy, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -138,7 +138,7 @@ struct CachedPostingRow {
     doc_len: u32,
     tf: u16,
     #[serde(default)]
-    tf_norm: f32,
+    tf_norm: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -309,6 +309,7 @@ impl ClickHouseConversationRepository {
         docs: u64,
         total_doc_len: u64,
         index_watermark: SearchIndexWatermark,
+        search_strategy: SearchEventsStrategy,
         include_tool_events: bool,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
@@ -319,11 +320,12 @@ impl ClickHouseConversationRepository {
         let mut cache_terms = terms.to_vec();
         cache_terms.sort_unstable();
         format!(
-            "docs={docs};total_doc_len={total_doc_len};idx_wm={}:{}:{}:{};incl_tools={include_tool_events};excl_codex={exclude_codex_mcp};session={};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
+            "docs={docs};total_doc_len={total_doc_len};idx_wm={}:{}:{}:{};strategy={};incl_tools={include_tool_events};excl_codex={exclude_codex_mcp};session={};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
             index_watermark.docs_max_block,
             index_watermark.posts_max_block,
             index_watermark.docs_rows,
             index_watermark.posts_rows,
+            search_strategy.as_str(),
             session_id.unwrap_or(""),
             cache_terms.join(",")
         )
@@ -785,7 +787,7 @@ ANY INNER JOIN {documents_table} AS d ON d.event_uid = p.doc_id
 WHERE {where_sql}
 GROUP BY p.doc_id
 HAVING matched_terms >= {min_should_match} AND score >= {min_score:.6}
-ORDER BY score DESC
+ORDER BY score DESC, event_uid ASC
 LIMIT {limit}
 FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
@@ -1061,7 +1063,7 @@ FORMAT JSONEachRow",
             let k1 = self.cfg.bm25_k1.max(0.01);
             let b = self.cfg.bm25_b.clamp(0.0, 1.0);
             for row in &mut fetched_rows {
-                row.tf_norm = Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b) as f32;
+                row.tf_norm = Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
             }
             let mut grouped = HashMap::<String, Vec<CachedPostingRow>>::new();
             for row in fetched_rows {
@@ -1203,9 +1205,7 @@ FORMAT JSONEachRow",
                 initial_candidate_limit,
             )
             .await?;
-        if initial_rows.len() >= limit as usize
-            || initial_candidate_count < initial_candidate_limit as usize
-        {
+        if initial_candidate_count < initial_candidate_limit as usize {
             return Ok(initial_rows);
         }
 
@@ -1226,15 +1226,42 @@ FORMAT JSONEachRow",
                 )
                 .await?;
 
-            if expanded_rows.len() >= limit as usize
-                || expanded_candidate_count < expanded_candidate_limit as usize
-            {
+            // Only accept fast-pass results when we considered the full candidate set.
+            // If candidate count reaches the cap, ranking may be truncated; preserve
+            // exact behavior by falling back to the full SQL path.
+            if expanded_candidate_count < expanded_candidate_limit as usize {
                 return Ok(expanded_rows);
             }
         }
 
         // Fast candidates were exhausted before we could satisfy the requested limit.
         // Fall back to the original SQL shape to preserve exact behavior.
+        self.search_events_rows_exact_sql(
+            terms,
+            docs,
+            avgdl,
+            include_tool_events,
+            exclude_codex_mcp,
+            session_id,
+            min_should_match,
+            min_score,
+            limit,
+        )
+        .await
+    }
+
+    async fn search_events_rows_exact_sql(
+        &self,
+        terms: &[String],
+        docs: u64,
+        avgdl: f64,
+        include_tool_events: bool,
+        exclude_codex_mcp: bool,
+        session_id: Option<&str>,
+        min_should_match: u16,
+        min_score: f64,
+        limit: u16,
+    ) -> RepoResult<Vec<SearchRow>> {
         let df_map = self.df_map(terms).await?;
         let mut idf_by_term = HashMap::<String, f64>::new();
         for term in terms {
@@ -1258,8 +1285,57 @@ FORMAT JSONEachRow",
 
         let mut fallback_rows: Vec<SearchRow> =
             self.map_backend(self.ch.query_rows(&fallback_sql, None).await)?;
-        fallback_rows.sort_by(|a, b| b.score.total_cmp(&a.score));
+        fallback_rows.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.event_uid.cmp(&b.event_uid))
+        });
         Ok(fallback_rows)
+    }
+
+    async fn search_events_rows_by_strategy(
+        &self,
+        strategy: SearchEventsStrategy,
+        terms: &[String],
+        docs: u64,
+        avgdl: f64,
+        include_tool_events: bool,
+        exclude_codex_mcp: bool,
+        session_id: Option<&str>,
+        min_should_match: u16,
+        min_score: f64,
+        limit: u16,
+    ) -> RepoResult<Vec<SearchRow>> {
+        match strategy {
+            SearchEventsStrategy::Optimized => {
+                self.search_events_rows(
+                    terms,
+                    docs,
+                    avgdl,
+                    include_tool_events,
+                    exclude_codex_mcp,
+                    session_id,
+                    min_should_match,
+                    min_score,
+                    limit,
+                )
+                .await
+            }
+            SearchEventsStrategy::OracleExact => {
+                self.search_events_rows_exact_sql(
+                    terms,
+                    docs,
+                    avgdl,
+                    include_tool_events,
+                    exclude_codex_mcp,
+                    session_id,
+                    min_should_match,
+                    min_score,
+                    limit,
+                )
+                .await
+            }
+        }
     }
 
     async fn search_events_rows_fast_pass(
@@ -1286,12 +1362,10 @@ FORMAT JSONEachRow",
         let postings_by_term = self
             .load_term_postings_for_terms(terms, watermark, avgdl)
             .await?;
+        let df_map = self.df_map(terms).await?;
         let mut idf_by_term = HashMap::<&str, f64>::new();
         for term in terms {
-            let df = postings_by_term
-                .get(term)
-                .map(|rows| rows.len() as u64)
-                .unwrap_or(0);
+            let df = *df_map.get(term).unwrap_or(&0);
             idf_by_term.insert(term.as_str(), Self::bm25_idf(docs, df));
         }
 
@@ -1318,7 +1392,7 @@ FORMAT JSONEachRow",
                         continue;
                     }
 
-                    let score = idf * row.tf_norm as f64;
+                    let score = idf * row.tf_norm;
                     if score < min_score {
                         continue;
                     }
@@ -1360,7 +1434,7 @@ FORMAT JSONEachRow",
                                     matched_mask: 0,
                                 });
 
-                        entry.score += idf * row.tf_norm as f64;
+                        entry.score += idf * row.tf_norm;
                         entry.matched_mask |= 1u64 << idx;
                     }
                 }
@@ -2107,6 +2181,12 @@ FORMAT JSONEachRow",
             .exclude_codex_mcp
             .unwrap_or(self.cfg.default_exclude_codex_mcp);
         let disable_cache = query.disable_cache.unwrap_or(false);
+        let search_strategy = query.search_strategy.unwrap_or_default();
+        let effective_strategy = if disable_cache {
+            SearchEventsStrategy::OracleExact
+        } else {
+            search_strategy
+        };
 
         if let Some(session_id) = query.session_id.as_deref() {
             Self::validate_session_id(session_id)?;
@@ -2155,7 +2235,8 @@ FORMAT JSONEachRow",
 
         let hits = if disable_cache {
             let rows = self
-                .search_events_rows(
+                .search_events_rows_by_strategy(
+                    effective_strategy,
                     &terms,
                     docs,
                     avgdl,
@@ -2175,6 +2256,7 @@ FORMAT JSONEachRow",
                 docs,
                 total_doc_len,
                 index_watermark,
+                effective_strategy,
                 include_tool_events,
                 exclude_codex_mcp,
                 session_id,
@@ -2187,7 +2269,8 @@ FORMAT JSONEachRow",
                 cached_hits
             } else {
                 let fresh_rows = self
-                    .search_events_rows(
+                    .search_events_rows_by_strategy(
+                        effective_strategy,
                         &terms,
                         docs,
                         avgdl,
