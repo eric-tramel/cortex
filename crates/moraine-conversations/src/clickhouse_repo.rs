@@ -2538,17 +2538,17 @@ mod tests {
     fn search_doc_filters_exclude_codex_by_flag() {
         let mut row = sample_search_doc();
         row.has_codex_mcp = 1;
-        assert!(!ClickHouseConversationRepository::passes_search_doc_filters(
-            &row, false, true, None
-        ));
+        assert!(
+            !ClickHouseConversationRepository::passes_search_doc_filters(&row, false, true, None)
+        );
     }
 
     #[test]
     fn search_doc_filters_exclude_codex_by_tool_name() {
         let mut row = sample_search_doc();
         row.name = "search".to_string();
-        assert!(!ClickHouseConversationRepository::passes_search_doc_filters(
-            &row, false, true, None
-        ));
+        assert!(
+            !ClickHouseConversationRepository::passes_search_doc_filters(&row, false, true, None)
+        );
     }
 }
