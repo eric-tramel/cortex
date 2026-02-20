@@ -19,6 +19,10 @@ Specifically, Morine provides:
 <img width="1784" height="1167" alt="image" src="https://github.com/user-attachments/assets/150a0ed5-1daf-4eb5-b60e-d3ee2221b22f" />
 
 
+| :warning: WARNING           |
+|:----------------------------|
+| Moraine is under active development, so features or schemas may change or move around whenever Y changes in vX.Y.Z. |
+
 ## Quickstart
 
 Install `moraine` (prebuilt bundle) to `~/.local/bin`. 
