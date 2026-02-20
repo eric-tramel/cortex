@@ -84,7 +84,7 @@ main() {
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   local package_script="$repo_root/scripts/package-moraine-release.sh"
-  local install_script="$repo_root/scripts/install-moraine.sh"
+  local install_script="$repo_root/scripts/install.sh"
   local e2e_script="$repo_root/scripts/ci/e2e-stack.sh"
   local python_bin="${PYTHON_BIN:-python3}"
   local run_stamp

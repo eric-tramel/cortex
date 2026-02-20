@@ -6,7 +6,7 @@ usage() {
 Install Moraine binaries from release bundle artifacts.
 
 usage:
-  scripts/install-moraine.sh [options]
+  scripts/install.sh [options]
 
 options:
   --repo <owner/repo>      GitHub repository hosting release assets
@@ -20,10 +20,10 @@ options:
   -h, --help            Show help
 
 examples:
-  scripts/install-moraine.sh
-  scripts/install-moraine.sh --version v0.1.1
-  scripts/install-moraine.sh --repo your-org/moraine-fork --version v0.1.1
-  scripts/install-moraine.sh --asset-base-url http://127.0.0.1:8080 --version ci-e2e
+  scripts/install.sh
+  scripts/install.sh --version v0.1.1
+  scripts/install.sh --repo your-org/moraine-fork --version v0.1.1
+  scripts/install.sh --asset-base-url http://127.0.0.1:8080 --version ci-e2e
 EOF
 }
 

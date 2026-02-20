@@ -12,7 +12,7 @@ Moraine indexes your Claude Code and Codex session logs into a local ClickHouse 
 Install `moraine` (prebuilt bundle):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install-moraine.sh \
+curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
   | bash
 export PATH="$HOME/.local/bin:$PATH"
 ```

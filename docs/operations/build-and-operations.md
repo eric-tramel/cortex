@@ -44,7 +44,7 @@ done
 ### Prebuilt release binary
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install-moraine.sh \
+curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
   | bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
@@ -73,7 +73,7 @@ Tag-driven GitHub Actions release workflow:
 
 Each bundle includes `manifest.json` with target/version metadata, per-binary checksums, and build metadata.
 
-Multiplatform functional CI (`.github/workflows/ci-functional.yml`) also packages per-target bundles and validates `scripts/install-moraine.sh` by installing from a local artifact server before running the stack + MCP smoke test.
+Multiplatform functional CI (`.github/workflows/ci-functional.yml`) also packages per-target bundles and validates `scripts/install.sh` by installing from a local artifact server before running the stack + MCP smoke test.
 
 ## Config model
 
