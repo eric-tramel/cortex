@@ -13,7 +13,7 @@ Install `moraine` (prebuilt bundle):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
-  | bash
+  | sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -21,10 +21,10 @@ The installer is environment-configured (not flag-configured). Common overrides:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
-  | MORAINE_INSTALL_VERSION=v0.1.1 bash
+  | MORAINE_INSTALL_VERSION=v0.1.1 sh
 
 curl -fsSL https://raw.githubusercontent.com/eric-tramel/moraine/main/scripts/install.sh \
-  | MORAINE_INSTALL_DIR="$HOME/bin" MORAINE_INSTALL_SKIP_CLICKHOUSE=1 bash
+  | MORAINE_INSTALL_DIR="$HOME/bin" MORAINE_INSTALL_SKIP_CLICKHOUSE=1 sh
 ```
 
 Start the stack and confirm it is healthy:

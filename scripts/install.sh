@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env sh
+set -eu
 
 usage() {
   cat <<'USAGE'
@@ -43,7 +43,7 @@ require_cmd() {
 
 is_truthy() {
   case "${1:-}" in
-    1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn])
       return 0
       ;;
     *)
@@ -53,32 +53,31 @@ is_truthy() {
 }
 
 resolve_install_dir() {
-  if [[ -n "${MORAINE_INSTALL_DIR:-}" ]]; then
+  if [ -n "${MORAINE_INSTALL_DIR:-}" ]; then
     printf '%s\n' "$MORAINE_INSTALL_DIR"
     return
   fi
 
-  if [[ -n "${XDG_BIN_HOME:-}" ]]; then
+  if [ -n "${XDG_BIN_HOME:-}" ]; then
     printf '%s\n' "$XDG_BIN_HOME"
     return
   fi
 
-  if [[ -n "${XDG_DATA_HOME:-}" ]]; then
+  if [ -n "${XDG_DATA_HOME:-}" ]; then
     printf '%s/bin\n' "$(dirname "$XDG_DATA_HOME")"
     return
   fi
 
-  printf '%s/.local/bin\n' "$HOME"
+  printf '%s/.local/bin\n' "${HOME:?HOME is not set}"
 }
 
 resolve_receipt_path() {
-  local config_home
-  config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+  config_home="${XDG_CONFIG_HOME:-${HOME:?HOME is not set}/.config}"
   printf '%s/moraine/install-receipt.json\n' "$config_home"
 }
 
 checksum_of() {
-  local path="$1"
+  path="$1"
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$path" | awk '{print $1}'
     return
@@ -96,16 +95,22 @@ checksum_of() {
 }
 
 manifest_checksum() {
-  local manifest="$1"
-  local key="$2"
-  grep -E "\"${key}\"[[:space:]]*:" "$manifest" \
-    | head -n 1 \
-    | sed -nE 's/.*:[[:space:]]*"([0-9a-fA-F]+)".*/\1/p'
+  manifest="$1"
+  key="$2"
+  awk -v key="$key" '
+    $0 ~ "\"" key "\"" {
+      if (match($0, /"[0-9A-Fa-f]+"/)) {
+        value = substr($0, RSTART + 1, RLENGTH - 2)
+        print value
+        exit
+      }
+    }
+  ' "$manifest"
 }
 
 verify_checksum() {
-  local archive="$1"
-  local checksum_file="$2"
+  archive="$1"
+  checksum_file="$2"
 
   if command -v sha256sum >/dev/null 2>&1; then
     (cd "$(dirname "$archive")" && sha256sum -c "$checksum_file")
@@ -113,10 +118,9 @@ verify_checksum() {
   fi
 
   if command -v shasum >/dev/null 2>&1; then
-    local expected actual
     expected="$(awk '{print $1}' "$checksum_file")"
     actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
-    if [[ "$expected" != "$actual" ]]; then
+    if [ "$expected" != "$actual" ]; then
       echo "checksum mismatch for $archive"
       exit 1
     fi
@@ -124,10 +128,9 @@ verify_checksum() {
   fi
 
   if command -v openssl >/dev/null 2>&1; then
-    local expected actual
     expected="$(awk '{print $1}' "$checksum_file")"
     actual="$(openssl dgst -sha256 "$archive" | awk '{print $NF}')"
-    if [[ "$expected" != "$actual" ]]; then
+    if [ "$expected" != "$actual" ]; then
       echo "checksum mismatch for $archive"
       exit 1
     fi
@@ -139,7 +142,6 @@ verify_checksum() {
 }
 
 detect_target_triple() {
-  local os arch
   os="$(uname -s)"
   arch="$(uname -m)"
 
@@ -161,48 +163,41 @@ detect_target_triple() {
       ;;
   esac
 
-  echo "${arch}-${os}"
+  printf '%s\n' "${arch}-${os}"
 }
 
 fetch_latest_tag() {
-  local repo="$1"
-  local api_url="https://api.github.com/repos/${repo}/releases/latest"
-  local response tag
+  repo="$1"
+  api_url="https://api.github.com/repos/${repo}/releases/latest"
 
   if ! response="$(curl -fsSL "$api_url")"; then
     echo "failed to resolve latest release tag from $api_url"
     exit 1
   fi
 
-  tag="$(printf '%s\n' "$response" | sed -nE 's/^[[:space:]]*"tag_name":[[:space:]]*"([^"]+)".*$/\1/p' | head -n 1)"
-  if [[ -z "$tag" ]]; then
+  tag="$(printf '%s\n' "$response" | awk -F '"' '/"tag_name"[[:space:]]*:/ { print $4; exit }')"
+  if [ -z "$tag" ]; then
     echo "failed to parse latest release tag from $api_url"
     exit 1
   fi
 
-  echo "$tag"
+  printf '%s\n' "$tag"
 }
 
 json_escape() {
-  local value="$1"
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  value="${value//$'\n'/\\n}"
-  value="${value//$'\r'/\\r}"
-  value="${value//$'\t'/\\t}"
-  printf '%s' "$value"
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
 write_install_receipt() {
-  local receipt_path="$1"
-  local installed_at_utc="$2"
-  local repo="$3"
-  local requested_version="$4"
-  local resolved_version="$5"
-  local target="$6"
-  local install_dir="$7"
-  local asset_url="$8"
-  local checksum_url="$9"
+  receipt_path="$1"
+  installed_at_utc="$2"
+  repo="$3"
+  requested_version="$4"
+  resolved_version="$5"
+  target="$6"
+  install_dir="$7"
+  asset_url="$8"
+  checksum_url="$9"
 
   mkdir -p "$(dirname "$receipt_path")"
 
@@ -227,8 +222,8 @@ write_install_receipt() {
 RECEIPT
 }
 
-if [[ $# -gt 0 ]]; then
-  if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+if [ "$#" -gt 0 ]; then
+  if [ "$#" -eq 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
     usage
     exit 0
   fi
@@ -245,15 +240,15 @@ version="$requested_version"
 install_dir="$(resolve_install_dir)"
 receipt_path="$(resolve_receipt_path)"
 skip_clickhouse=0
-bins=(moraine moraine-ingest moraine-monitor moraine-mcp)
+bins="moraine moraine-ingest moraine-monitor moraine-mcp"
 
 if is_truthy "${MORAINE_INSTALL_SKIP_CLICKHOUSE:-}"; then
   skip_clickhouse=1
 fi
 
-if [[ -n "$asset_base_url" ]]; then
-  asset_base_url="${asset_base_url%/}"
-  if [[ "$version" == "latest" ]]; then
+if [ -n "$asset_base_url" ]; then
+  asset_base_url=${asset_base_url%/}
+  if [ "$version" = "latest" ]; then
     echo "MORAINE_INSTALL_VERSION <tag> is required when MORAINE_INSTALL_ASSET_BASE_URL is set"
     usage
     exit 64
@@ -264,13 +259,13 @@ require_cmd curl
 require_cmd tar
 
 target="$(detect_target_triple)"
-if [[ "$version" == "latest" ]]; then
+if [ "$version" = "latest" ]; then
   version="$(fetch_latest_tag "$repo")"
 fi
 
 asset_name="moraine-bundle-${target}.tar.gz"
 checksum_name="moraine-bundle-${target}.sha256"
-if [[ -n "$asset_base_url" ]]; then
+if [ -n "$asset_base_url" ]; then
   asset_url="${asset_base_url}/${asset_name}"
   checksum_url="${asset_base_url}/${checksum_name}"
 else
@@ -279,13 +274,13 @@ else
 fi
 
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
+trap 'rm -rf "$tmp_dir"' 0 HUP INT TERM
 
 echo "installing Moraine ${version} for ${target}"
 echo "downloading: ${asset_url}"
 if ! curl -fL "$asset_url" -o "$tmp_dir/$asset_name"; then
   echo "failed to download release asset: $asset_url"
-  if [[ -n "$asset_base_url" ]]; then
+  if [ -n "$asset_base_url" ]; then
     echo "verify that the artifact is available at:"
     echo "  $asset_url"
   else
@@ -296,7 +291,7 @@ if ! curl -fL "$asset_url" -o "$tmp_dir/$asset_name"; then
 fi
 if ! curl -fL "$checksum_url" -o "$tmp_dir/$checksum_name"; then
   echo "failed to download release checksum: $checksum_url"
-  if [[ -n "$asset_base_url" ]]; then
+  if [ -n "$asset_base_url" ]; then
     echo "verify that the checksum is available at:"
     echo "  $checksum_url"
   else
@@ -312,26 +307,26 @@ extract_dir="$tmp_dir/extracted"
 mkdir -p "$extract_dir"
 tar -xzf "$tmp_dir/$asset_name" -C "$extract_dir"
 
-if [[ ! -f "$extract_dir/manifest.json" ]]; then
+if [ ! -f "$extract_dir/manifest.json" ]; then
   echo "archive did not contain required manifest: manifest.json"
   exit 1
 fi
 
-manifest_target="$(sed -nE 's/^[[:space:]]*"target"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/p' "$extract_dir/manifest.json" | head -n 1)"
-if [[ -n "$manifest_target" && "$manifest_target" != "$target" ]]; then
+manifest_target="$(awk -F '"' '/"target"[[:space:]]*:/ { print $4; exit }' "$extract_dir/manifest.json")"
+if [ -n "$manifest_target" ] && [ "$manifest_target" != "$target" ]; then
   echo "bundle target mismatch: expected $target, manifest has $manifest_target"
   exit 1
 fi
 
-for bin in "${bins[@]}"; do
-  if [[ ! -f "$extract_dir/bin/$bin" ]]; then
+for bin in $bins; do
+  if [ ! -f "$extract_dir/bin/$bin" ]; then
     echo "archive did not contain required binary: bin/$bin"
     exit 1
   fi
   expected_sum="$(manifest_checksum "$extract_dir/manifest.json" "bin/$bin")"
-  if [[ -n "$expected_sum" ]]; then
+  if [ -n "$expected_sum" ]; then
     actual_sum="$(checksum_of "$extract_dir/bin/$bin")"
-    if [[ "$expected_sum" != "$actual_sum" ]]; then
+    if [ "$expected_sum" != "$actual_sum" ]; then
       echo "manifest checksum mismatch for bin/$bin"
       echo "expected: $expected_sum"
       echo "actual:   $actual_sum"
@@ -341,12 +336,12 @@ for bin in "${bins[@]}"; do
 done
 
 mkdir -p "$install_dir"
-for bin in "${bins[@]}"; do
+for bin in $bins; do
   cp "$extract_dir/bin/$bin" "$install_dir/$bin"
   chmod +x "$install_dir/$bin"
 done
 
-for bin in "${bins[@]}"; do
+for bin in $bins; do
   if ! "$install_dir/$bin" --help >/dev/null 2>&1; then
     echo "installed binary failed health check (--help): $install_dir/$bin"
     exit 1
@@ -368,14 +363,18 @@ write_install_receipt \
 echo "installed binaries to: $install_dir"
 echo "wrote install receipt: $receipt_path"
 
-if [[ ":$PATH:" != *":$install_dir:"* ]]; then
-  echo
-  echo "note: $install_dir is not currently on PATH."
-  echo "add this to your shell profile:"
-  echo "  export PATH=\"$install_dir:\$PATH\""
-fi
+case ":${PATH:-}:" in
+  *":$install_dir:"*)
+    ;;
+  *)
+    echo
+    echo "note: $install_dir is not currently on PATH."
+    echo "add this to your shell profile:"
+    echo "  export PATH=\"$install_dir:\$PATH\""
+    ;;
+esac
 
-if [[ "$skip_clickhouse" -ne 1 ]]; then
+if [ "$skip_clickhouse" -ne 1 ]; then
   echo
   echo "installing managed ClickHouse..."
   if ! "$install_dir/moraine" clickhouse install; then
