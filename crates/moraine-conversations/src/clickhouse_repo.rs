@@ -1542,8 +1542,7 @@ FORMAT JSONEachRow",
     fn conversation_candidate_limit(limit: u16) -> usize {
         (limit as usize)
             .saturating_mul(CONVERSATION_CANDIDATE_MULTIPLIER)
-            .max(CONVERSATION_CANDIDATE_MIN)
-            .min(CONVERSATION_CANDIDATE_MAX)
+            .clamp(CONVERSATION_CANDIDATE_MIN, CONVERSATION_CANDIDATE_MAX)
     }
 
     fn now_unix_ms() -> i64 {
@@ -2878,12 +2877,10 @@ FORMAT JSONEachRow",
                 let snippet = best_event_uid
                     .as_ref()
                     .and_then(|event_uid| snippet_by_event_uid.get(event_uid).cloned())
-                    .or_else(|| {
-                        if row.snippet.is_empty() {
-                            None
-                        } else {
-                            Some(row.snippet)
-                        }
+                    .or(if row.snippet.is_empty() {
+                        None
+                    } else {
+                        Some(row.snippet)
                     });
                 ConversationSearchHit {
                     rank: idx + 1,
