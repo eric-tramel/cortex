@@ -1,5 +1,7 @@
 # Moraine
 
+[![Docs](https://github.com/eric-tramel/moraine/actions/workflows/docs-deploy.yml/badge.svg)](https://eric-tramel.github.io/moraine/)
+
 Moraine indexes your Claude Code and Codex session logs into a local ClickHouse database — giving your agents searchable long-term memory and giving you a unified record of everything they've done.
 
 - **Agent memory via MCP**: agents search and retrieve context from past conversations using `search` and `open` tools

@@ -1,6 +1,6 @@
 site_name: Moraine Documentation
 site_description: Local ClickHouse + Rust ingestion + BM25 indexing architecture and operations
-site_url: http://127.0.0.1:8000
+site_url: https://eric-tramel.github.io/moraine/
 
 docs_dir: docs
 site_dir: site
