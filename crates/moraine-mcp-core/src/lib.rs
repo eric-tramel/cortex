@@ -17,6 +17,12 @@ use tracing::{debug, warn};
 
 const TOOL_LIMIT_MIN: u16 = 1;
 
+const CONVERSATION_MODE_CLASSIFICATION_SEMANTICS: &str =
+    "Sessions are classified into exactly one mode by first match on any event in the session: web_search > mcp_internal > tool_calling > chat.";
+
+const SEARCH_CONVERSATIONS_MODE_DOC: &str =
+    "Optional `mode` filters by that computed session mode. Mode meanings: web_search=any web search activity (`web_search_call`, `search_results_received`, or `tool_use` with WebSearch/WebFetch); mcp_internal=any Codex MCP internal search/open activity (`source_name='codex-mcp'` or tool_name `search`/`open`) when web_search does not match; tool_calling=any tool activity (`tool_call`, `tool_result`, or `tool_use`) when neither higher mode matches; chat=none of the above.";
+
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Verbosity {
@@ -400,7 +406,9 @@ impl AppState {
                 },
                 {
                     "name": "search_conversations",
-                    "description": "BM25 lexical search across whole conversations.",
+                    "description": format!(
+                        "BM25 lexical search across whole conversations. {CONVERSATION_MODE_CLASSIFICATION_SEMANTICS} {SEARCH_CONVERSATIONS_MODE_DOC}"
+                    ),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -412,7 +420,8 @@ impl AppState {
                             "to_unix_ms": { "type": "integer" },
                             "mode": {
                                 "type": "string",
-                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat"]
+                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat"],
+                                "description": SEARCH_CONVERSATIONS_MODE_DOC
                             },
                             "include_tool_events": { "type": "boolean" },
                             "exclude_codex_mcp": { "type": "boolean" },
@@ -485,12 +494,13 @@ impl AppState {
                     self.cfg.mcp.max_results,
                 )?;
                 let verbosity = args.verbosity.unwrap_or_default();
+                let mode = args.mode;
                 let payload = self.search_conversations(args).await?;
                 match verbosity {
                     Verbosity::Full => Ok(tool_ok_full(payload)),
-                    Verbosity::Prose => {
-                        Ok(tool_ok_prose(format_conversation_search_prose(&payload)?))
-                    }
+                    Verbosity::Prose => Ok(tool_ok_prose(format_conversation_search_prose(
+                        &payload, mode,
+                    )?)),
                 }
             }
             "list_sessions" => {
@@ -815,7 +825,27 @@ fn format_open_prose(payload: &Value) -> Result<String> {
     Ok(out.trim_end().to_string())
 }
 
-fn format_conversation_search_prose(payload: &Value) -> Result<String> {
+fn mode_meaning(mode: ConversationMode) -> &'static str {
+    match mode {
+        ConversationMode::WebSearch => {
+            "any web search activity (`web_search_call`, `search_results_received`, or `tool_use` with WebSearch/WebFetch)"
+        }
+        ConversationMode::McpInternal => {
+            "any Codex MCP internal search/open activity (`source_name='codex-mcp'` or tool_name `search`/`open`) when web_search does not match"
+        }
+        ConversationMode::ToolCalling => {
+            "any tool activity (`tool_call`, `tool_result`, or `tool_use`) when neither higher mode matches"
+        }
+        ConversationMode::Chat => {
+            "no detected web-search, mcp-internal, or tool-calling activity"
+        }
+    }
+}
+
+fn format_conversation_search_prose(
+    payload: &Value,
+    mode: Option<ConversationMode>,
+) -> Result<String> {
     let parsed: ConversationSearchProsePayload = serde_json::from_value(payload.clone())
         .context("failed to parse search_conversations payload")?;
 
@@ -832,6 +862,15 @@ fn format_conversation_search_prose(payload: &Value) -> Result<String> {
         parsed.stats.limit_capped,
     ) {
         out.push_str(&format!("Limit: {limit_summary}\n"));
+    }
+
+    if let Some(mode) = mode {
+        out.push_str(&format!("Mode filter: {}\n", mode.as_str()));
+        out.push_str(&format!(
+            "Mode semantics: {}\n",
+            CONVERSATION_MODE_CLASSIFICATION_SEMANTICS
+        ));
+        out.push_str(&format!("Mode meaning: {}\n", mode_meaning(mode)));
     }
 
     if parsed.hits.is_empty() {
@@ -1073,7 +1112,7 @@ mod tests {
             "hits": []
         });
 
-        let text = format_conversation_search_prose(&payload).expect("format");
+        let text = format_conversation_search_prose(&payload, None).expect("format");
         assert!(text.contains("Conversation Search"));
         assert!(text.contains("No hits"));
     }
@@ -1142,8 +1181,38 @@ mod tests {
             "hits": []
         });
 
-        let text = format_conversation_search_prose(&payload).expect("format");
+        let text = format_conversation_search_prose(&payload, None).expect("format");
         assert!(text.contains("Limit: effective=10 (requested=10)"));
+    }
+
+    #[test]
+    fn format_conversation_search_includes_mode_semantics_when_mode_filter_is_set() {
+        let payload = json!({
+            "query_id": "q1",
+            "query": "hello world",
+            "stats": {
+                "took_ms": 2,
+                "result_count": 0
+            },
+            "hits": []
+        });
+
+        let text = format_conversation_search_prose(&payload, Some(ConversationMode::ToolCalling))
+            .expect("format");
+        assert!(text.contains("Mode filter: tool_calling"));
+        assert!(text.contains("Mode semantics: Sessions are classified into exactly one mode"));
+        assert!(text.contains("Mode meaning: any tool activity"));
+    }
+
+    #[test]
+    fn search_conversations_mode_doc_describes_precedence_and_mode_meanings() {
+        assert!(CONVERSATION_MODE_CLASSIFICATION_SEMANTICS
+            .contains("web_search > mcp_internal > tool_calling > chat"));
+        assert!(SEARCH_CONVERSATIONS_MODE_DOC.contains("web_search=any web search activity"));
+        assert!(SEARCH_CONVERSATIONS_MODE_DOC
+            .contains("mcp_internal=any Codex MCP internal search/open activity"));
+        assert!(SEARCH_CONVERSATIONS_MODE_DOC.contains("tool_calling=any tool activity"));
+        assert!(SEARCH_CONVERSATIONS_MODE_DOC.contains("chat=none of the above"));
     }
 
     #[test]
@@ -1175,7 +1244,7 @@ mod tests {
             ]
         });
 
-        let text = format_conversation_search_prose(&payload).expect("format");
+        let text = format_conversation_search_prose(&payload, None).expect("format");
         assert!(text.contains("provider: codex"));
         assert!(text.contains("first_last: 2026-01-03 10:00:00 -> 2026-01-03 10:10:00"));
         assert!(text.contains("session_slug: project-c"));
