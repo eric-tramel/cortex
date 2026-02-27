@@ -109,6 +109,12 @@ struct SearchProseStats {
     took_ms: u64,
     #[serde(default)]
     result_count: u64,
+    #[serde(default)]
+    requested_limit: Option<u16>,
+    #[serde(default)]
+    effective_limit: Option<u16>,
+    #[serde(default)]
+    limit_capped: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -185,6 +191,12 @@ struct ConversationSearchProseStats {
     took_ms: u64,
     #[serde(default)]
     result_count: u64,
+    #[serde(default)]
+    requested_limit: Option<u16>,
+    #[serde(default)]
+    effective_limit: Option<u16>,
+    #[serde(default)]
+    limit_capped: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -526,6 +538,13 @@ fn format_search_prose(payload: &Value) -> Result<String> {
         "Hits: {} ({} ms)\n",
         parsed.stats.result_count, parsed.stats.took_ms
     ));
+    if let Some(limit_summary) = format_limit_summary(
+        parsed.stats.requested_limit,
+        parsed.stats.effective_limit,
+        parsed.stats.limit_capped,
+    ) {
+        out.push_str(&format!("Limit: {limit_summary}\n"));
+    }
 
     if parsed.hits.is_empty() {
         out.push_str("\nNo hits.");
@@ -627,6 +646,13 @@ fn format_conversation_search_prose(payload: &Value) -> Result<String> {
         "Hits: {} ({} ms)\n",
         parsed.stats.result_count, parsed.stats.took_ms
     ));
+    if let Some(limit_summary) = format_limit_summary(
+        parsed.stats.requested_limit,
+        parsed.stats.effective_limit,
+        parsed.stats.limit_capped,
+    ) {
+        out.push_str(&format!("Limit: {limit_summary}\n"));
+    }
 
     if parsed.hits.is_empty() {
         out.push_str("\nNo hits.");
@@ -668,6 +694,22 @@ fn append_open_event_line(out: &mut String, event: &OpenProseEvent) {
     let text = compact_text_line(&event.text_content, 220);
     if !text.is_empty() {
         out.push_str(&format!("  {}\n", text));
+    }
+}
+
+fn format_limit_summary(
+    requested_limit: Option<u16>,
+    effective_limit: Option<u16>,
+    limit_capped: bool,
+) -> Option<String> {
+    let effective = effective_limit?;
+    match requested_limit {
+        Some(requested) if limit_capped => Some(format!(
+            "effective={} (capped at max_results={}; requested={})",
+            effective, effective, requested
+        )),
+        Some(requested) => Some(format!("effective={} (requested={})", effective, requested)),
+        None => Some(format!("effective={effective}")),
     }
 }
 
@@ -785,5 +827,43 @@ mod tests {
         let text = format_conversation_search_prose(&payload).expect("format");
         assert!(text.contains("Conversation Search"));
         assert!(text.contains("No hits"));
+    }
+
+    #[test]
+    fn format_search_prose_reports_capped_limit_metadata() {
+        let payload = json!({
+            "query_id": "q1",
+            "query": "big iron",
+            "stats": {
+                "took_ms": 7,
+                "result_count": 25,
+                "requested_limit": 100,
+                "effective_limit": 25,
+                "limit_capped": true
+            },
+            "hits": []
+        });
+
+        let text = format_search_prose(&payload).expect("format");
+        assert!(text.contains("Limit: effective=25 (capped at max_results=25; requested=100)"));
+    }
+
+    #[test]
+    fn format_conversation_search_reports_effective_limit_when_uncapped() {
+        let payload = json!({
+            "query_id": "q1",
+            "query": "hello world",
+            "stats": {
+                "took_ms": 2,
+                "result_count": 0,
+                "requested_limit": 10,
+                "effective_limit": 10,
+                "limit_capped": false
+            },
+            "hits": []
+        });
+
+        let text = format_conversation_search_prose(&payload).expect("format");
+        assert!(text.contains("Limit: effective=10 (requested=10)"));
     }
 }

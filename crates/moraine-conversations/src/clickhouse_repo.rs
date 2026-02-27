@@ -2575,11 +2575,9 @@ FORMAT JSONEachRow",
         }
         let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
 
-        let limit = query
-            .limit
-            .unwrap_or(self.cfg.max_results)
-            .max(1)
-            .min(self.cfg.max_results);
+        let requested_limit = query.limit.unwrap_or(self.cfg.max_results).max(1);
+        let limit = requested_limit.min(self.cfg.max_results);
+        let limit_capped = requested_limit > limit;
 
         let min_should_match = query
             .min_should_match
@@ -2613,6 +2611,9 @@ FORMAT JSONEachRow",
                     avgdl: 0.0,
                     took_ms: started.elapsed().as_millis() as u32,
                     result_count: 0,
+                    requested_limit,
+                    effective_limit: limit,
+                    limit_capped,
                 },
                 hits: Vec::new(),
             });
@@ -2724,6 +2725,9 @@ FORMAT JSONEachRow",
                 avgdl,
                 took_ms,
                 result_count: hits.len(),
+                requested_limit,
+                effective_limit: limit,
+                limit_capped,
             },
             hits,
         })
@@ -2749,11 +2753,9 @@ FORMAT JSONEachRow",
         }
         let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
 
-        let limit = query
-            .limit
-            .unwrap_or(self.cfg.max_results)
-            .max(1)
-            .min(self.cfg.max_results);
+        let requested_limit = query.limit.unwrap_or(self.cfg.max_results).max(1);
+        let limit = requested_limit.min(self.cfg.max_results);
+        let limit_capped = requested_limit > limit;
 
         let min_should_match = query
             .min_should_match
@@ -2780,6 +2782,9 @@ FORMAT JSONEachRow",
                     avgdl: 0.0,
                     took_ms: started.elapsed().as_millis() as u32,
                     result_count: 0,
+                    requested_limit,
+                    effective_limit: limit,
+                    limit_capped,
                 },
                 hits: Vec::new(),
             });
@@ -2903,6 +2908,9 @@ FORMAT JSONEachRow",
                 avgdl,
                 took_ms: started.elapsed().as_millis() as u32,
                 result_count: hits.len(),
+                requested_limit,
+                effective_limit: limit,
+                limit_capped,
             },
             hits,
         })
