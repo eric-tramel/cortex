@@ -222,7 +222,9 @@ async fn spawn_mock_server() -> (String, Arc<MockState>) {
     (format!("http://{}", addr), state)
 }
 
-async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
+async fn build_repo_with_max_results(
+    max_results: u16,
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
     let (base_url, state) = spawn_mock_server().await;
     let client =
         ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
@@ -230,12 +232,16 @@ async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
     let repo = ClickHouseConversationRepository::new(
         client,
         RepoConfig {
-            max_results: 100,
+            max_results,
             ..RepoConfig::default()
         },
     );
 
     (repo, state)
+}
+
+async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
+    build_repo_with_max_results(100).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -313,6 +319,9 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
     assert_eq!(result.hits[0].session_id, "sess_c");
     assert_eq!(result.hits[0].best_event_uid.as_deref(), Some("evt-c-42"));
     assert_eq!(result.hits[1].session_id, "sess_a");
+    assert_eq!(result.stats.requested_limit, 10);
+    assert_eq!(result.stats.effective_limit, 10);
+    assert!(!result.stats.limit_capped);
 
     let queries = state.queries.lock().expect("queries lock").clone();
     let agg_query = queries
@@ -325,6 +334,30 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
     assert!(agg_query.contains("ifNull(m.mode, 'chat') = 'chat'"));
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1767261600000"));
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) < 1767500000000"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_conversations_reports_capped_limit_metadata() {
+    let (repo, _state) = build_repo_with_max_results(25).await;
+
+    let result = repo
+        .search_conversations(ConversationSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(100),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            from_unix_ms: None,
+            to_unix_ms: None,
+            mode: None,
+            include_tool_events: Some(true),
+            exclude_codex_mcp: Some(false),
+        })
+        .await
+        .expect("search conversations");
+
+    assert_eq!(result.stats.requested_limit, 100);
+    assert_eq!(result.stats.effective_limit, 25);
+    assert!(result.stats.limit_capped);
 }
 
 #[tokio::test(flavor = "multi_thread")]
