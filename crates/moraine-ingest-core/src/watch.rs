@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 enum ActiveWatcher {
     Recommended(RecommendedWatcher),
@@ -158,13 +158,30 @@ fn queue_rescan(
     metrics: &Arc<Metrics>,
 ) {
     record_rescan(metrics);
-    if let Ok(paths) = enumerate_jsonl_files(glob_pattern) {
-        for path in paths {
-            let _ = tx.send(WorkItem {
-                source_name: source_name.to_string(),
-                provider: provider.to_string(),
-                path,
-            });
+    match enumerate_jsonl_files(glob_pattern) {
+        Ok(paths) => {
+            for path in paths {
+                let _ = tx.send(WorkItem {
+                    source_name: source_name.to_string(),
+                    provider: provider.to_string(),
+                    path,
+                });
+            }
+        }
+        Err(exc) => {
+            error!(
+                source = source_name,
+                provider,
+                glob_pattern,
+                error = %exc,
+                "watcher rescan enumeration failed"
+            );
+            record_watcher_error(
+                metrics,
+                &format!(
+                    "watcher rescan enumeration failed for source={source_name}, provider={provider}, glob={glob_pattern}: {exc}"
+                ),
+            );
         }
     }
 }
@@ -356,6 +373,7 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
+    use tokio::sync::mpsc::error::TryRecvError;
 
     #[test]
     fn rescan_events_require_reconcile() {
@@ -402,5 +420,25 @@ mod tests {
         }
 
         assert_eq!(metrics.watcher_registrations.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn queue_rescan_records_enumeration_failures() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = mpsc::unbounded_channel::<WorkItem>();
+
+        queue_rescan("[", "source-a", "provider-a", &tx, &metrics);
+
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(metrics.watcher_reset_count.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.watcher_error_count.load(Ordering::Relaxed), 1);
+        let last_error = metrics
+            .last_error
+            .lock()
+            .expect("metrics last_error mutex poisoned")
+            .clone();
+        assert!(last_error.contains("watcher rescan enumeration failed"));
+        assert!(last_error.contains("source=source-a"));
+        assert!(last_error.contains("provider=provider-a"));
     }
 }
