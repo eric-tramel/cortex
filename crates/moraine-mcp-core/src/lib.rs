@@ -1192,6 +1192,8 @@ mod tests {
             vec![SearchEventKind::Message, SearchEventKind::ToolResult]
         );
     }
+
+    #[test]
     fn tool_limit_bounds_use_shared_min_and_effective_max() {
         assert_eq!(tool_limit_bounds(25), (1, 25));
         assert_eq!(tool_limit_bounds(0), (1, 1));
