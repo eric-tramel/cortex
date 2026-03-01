@@ -554,6 +554,7 @@ async fn search_events_includes_session_time_bounds() {
             min_score: Some(0.0),
             min_should_match: Some(1),
             include_tool_events: Some(true),
+            event_kinds: None,
             exclude_codex_mcp: Some(false),
             disable_cache: Some(true),
             search_strategy: None,

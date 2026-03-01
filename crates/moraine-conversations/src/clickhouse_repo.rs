@@ -17,8 +17,9 @@ use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationMode,
     ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
     ConversationSearchStats, ConversationSummary, OpenContext, OpenEvent, OpenEventRequest, Page,
-    PageRequest, RepoConfig, SearchEventHit, SearchEventsQuery, SearchEventsResult,
-    SearchEventsStats, SearchEventsStrategy, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    PageRequest, RepoConfig, SearchEventHit, SearchEventKind, SearchEventsQuery,
+    SearchEventsResult, SearchEventsStats, SearchEventsStrategy, TraceEvent, Turn, TurnListFilter,
+    TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -337,6 +338,7 @@ impl ClickHouseConversationRepository {
                     min_score: None,
                     min_should_match: None,
                     include_tool_events: None,
+                    event_kinds: None,
                     exclude_codex_mcp: None,
                     disable_cache: Some(false),
                     search_strategy: Some(SearchEventsStrategy::Optimized),
@@ -364,6 +366,7 @@ impl ClickHouseConversationRepository {
                     min_score: None,
                     min_should_match: None,
                     include_tool_events: None,
+                    event_kinds: None,
                     exclude_codex_mcp: None,
                     disable_cache: Some(false),
                     search_strategy: Some(SearchEventsStrategy::Optimized),
@@ -419,6 +422,7 @@ impl ClickHouseConversationRepository {
         terms: &[String],
         search_strategy: SearchEventsStrategy,
         include_tool_events: bool,
+        event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
         min_should_match: u16,
@@ -427,8 +431,17 @@ impl ClickHouseConversationRepository {
     ) -> String {
         let mut cache_terms = terms.to_vec();
         cache_terms.sort_unstable();
+        let event_kind_sig = event_kinds
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
         format!(
-            "strategy={};incl_tools={include_tool_events};excl_codex={exclude_codex_mcp};session={};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
+            "strategy={};incl_tools={include_tool_events};event_kinds={event_kind_sig};excl_codex={exclude_codex_mcp};session={};msm={min_should_match};min_score={min_score:.12};limit={limit};terms={}",
             search_strategy.as_str(),
             session_id.unwrap_or(""),
             cache_terms.join(",")
@@ -560,6 +573,107 @@ GROUP BY session_id"
             ));
         }
         Ok(())
+    }
+
+    fn normalize_event_kinds(
+        event_kinds: Option<Vec<SearchEventKind>>,
+    ) -> RepoResult<Option<Vec<SearchEventKind>>> {
+        let Some(mut kinds) = event_kinds else {
+            return Ok(None);
+        };
+
+        if kinds.is_empty() {
+            return Err(RepoError::invalid_argument(
+                "event_kind filter cannot be an empty list",
+            ));
+        }
+
+        kinds.sort_unstable();
+        kinds.dedup();
+        Ok(Some(kinds))
+    }
+
+    fn matches_event_kind(event_class: &str, payload_type: &str, kind: SearchEventKind) -> bool {
+        match kind {
+            SearchEventKind::Message => {
+                event_class == "message"
+                    || (event_class == "event_msg"
+                        && matches!(
+                            payload_type,
+                            "user_message" | "agent_message" | "message" | "text"
+                        ))
+            }
+            SearchEventKind::Reasoning => {
+                event_class == "reasoning"
+                    || (event_class == "event_msg" && payload_type == "agent_reasoning")
+            }
+            SearchEventKind::ToolCall => {
+                event_class == "tool_call"
+                    || (event_class == "event_msg"
+                        && matches!(
+                            payload_type,
+                            "tool_use" | "function_call" | "custom_tool_call" | "web_search_call"
+                        ))
+            }
+            SearchEventKind::ToolResult => {
+                event_class == "tool_result"
+                    || (event_class == "event_msg"
+                        && matches!(
+                            payload_type,
+                            "tool_result"
+                                | "function_call_output"
+                                | "custom_tool_call_output"
+                                | "search_results_received"
+                        ))
+            }
+        }
+    }
+
+    fn matches_requested_event_kinds(
+        event_class: &str,
+        payload_type: &str,
+        event_kinds: &[SearchEventKind],
+    ) -> bool {
+        event_kinds
+            .iter()
+            .any(|kind| Self::matches_event_kind(event_class, payload_type, *kind))
+    }
+
+    fn single_event_kind_clause(
+        event_class_expr: &str,
+        payload_type_expr: &str,
+        kind: SearchEventKind,
+    ) -> String {
+        match kind {
+            SearchEventKind::Message => format!(
+                "({event_class_expr} = 'message' OR ({event_class_expr} = 'event_msg' AND {payload_type_expr} IN ('user_message', 'agent_message', 'message', 'text')))"
+            ),
+            SearchEventKind::Reasoning => format!(
+                "({event_class_expr} = 'reasoning' OR ({event_class_expr} = 'event_msg' AND {payload_type_expr} = 'agent_reasoning'))"
+            ),
+            SearchEventKind::ToolCall => format!(
+                "({event_class_expr} = 'tool_call' OR ({event_class_expr} = 'event_msg' AND {payload_type_expr} IN ('tool_use', 'function_call', 'custom_tool_call', 'web_search_call')))"
+            ),
+            SearchEventKind::ToolResult => format!(
+                "({event_class_expr} = 'tool_result' OR ({event_class_expr} = 'event_msg' AND {payload_type_expr} IN ('tool_result', 'function_call_output', 'custom_tool_call_output', 'search_results_received')))"
+            ),
+        }
+    }
+
+    fn event_kind_filter_clause(
+        event_class_expr: &str,
+        payload_type_expr: &str,
+        event_kinds: &[SearchEventKind],
+    ) -> String {
+        let clauses = event_kinds
+            .iter()
+            .map(|kind| Self::single_event_kind_clause(event_class_expr, payload_type_expr, *kind))
+            .collect::<Vec<_>>();
+        if clauses.len() == 1 {
+            clauses[0].clone()
+        } else {
+            format!("({})", clauses.join(" OR "))
+        }
     }
 
     fn is_low_information_system_event(actor_role: &str, payload_type: &str) -> bool {
@@ -842,6 +956,7 @@ FORMAT JSONEachRow",
         idf_by_term: &HashMap<String, f64>,
         avgdl: f64,
         include_tool_events: bool,
+        event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         use_document_codex_flag: bool,
         session_id: Option<&str>,
@@ -911,7 +1026,13 @@ GROUP BY event_uid)"
             where_clauses.push(format!("d.session_id = {}", sql_quote(sid)));
         }
 
-        if include_tool_events {
+        if let Some(event_kinds) = event_kinds {
+            where_clauses.push(Self::event_kind_filter_clause(
+                "d.event_class",
+                "d.payload_type",
+                event_kinds,
+            ));
+        } else if include_tool_events {
             where_clauses.push("d.payload_type != 'token_count'".to_string());
         } else {
             where_clauses
@@ -1098,6 +1219,7 @@ FORMAT JSONEachRow",
     fn passes_search_doc_filters(
         row: &SearchDocExtraCacheEntry,
         include_tool_events: bool,
+        event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
     ) -> bool {
@@ -1107,7 +1229,15 @@ FORMAT JSONEachRow",
             }
         }
 
-        if include_tool_events {
+        if let Some(event_kinds) = event_kinds {
+            if !Self::matches_requested_event_kinds(
+                &row.event_class,
+                &row.payload_type,
+                event_kinds,
+            ) {
+                return false;
+            }
+        } else if include_tool_events {
             if row.payload_type == "token_count" {
                 return false;
             }
@@ -1321,6 +1451,7 @@ FORMAT JSONEachRow",
         docs: u64,
         avgdl: f64,
         include_tool_events: bool,
+        event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
         min_should_match: u16,
@@ -1333,6 +1464,7 @@ FORMAT JSONEachRow",
                 docs,
                 avgdl,
                 include_tool_events,
+                event_kinds,
                 exclude_codex_mcp,
                 session_id,
                 min_should_match,
@@ -1350,6 +1482,7 @@ FORMAT JSONEachRow",
             docs,
             avgdl,
             include_tool_events,
+            event_kinds,
             exclude_codex_mcp,
             session_id,
             min_should_match,
@@ -1365,6 +1498,7 @@ FORMAT JSONEachRow",
         docs: u64,
         avgdl: f64,
         include_tool_events: bool,
+        event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
         min_should_match: u16,
@@ -1384,6 +1518,7 @@ FORMAT JSONEachRow",
             &idf_by_term,
             avgdl,
             include_tool_events,
+            event_kinds,
             exclude_codex_mcp,
             use_document_codex_flag,
             session_id,
@@ -1409,6 +1544,7 @@ FORMAT JSONEachRow",
         docs: u64,
         avgdl: f64,
         include_tool_events: bool,
+        event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
         min_should_match: u16,
@@ -1422,6 +1558,7 @@ FORMAT JSONEachRow",
                     docs,
                     avgdl,
                     include_tool_events,
+                    event_kinds,
                     exclude_codex_mcp,
                     session_id,
                     min_should_match,
@@ -1436,6 +1573,7 @@ FORMAT JSONEachRow",
                     docs,
                     avgdl,
                     include_tool_events,
+                    event_kinds,
                     exclude_codex_mcp,
                     session_id,
                     min_should_match,
@@ -1535,6 +1673,7 @@ FORMAT JSONEachRow",
         docs: u64,
         avgdl: f64,
         include_tool_events: bool,
+        event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         session_id: Option<&str>,
         min_should_match: u16,
@@ -1638,6 +1777,7 @@ FORMAT JSONEachRow",
                 if !Self::passes_search_doc_filters(
                     extra,
                     include_tool_events,
+                    event_kinds,
                     exclude_codex_mcp,
                     session_id,
                 ) {
@@ -2358,17 +2498,22 @@ FORMAT JSONEachRow",
         min_should_match: u16,
         min_score: f64,
         include_tool_events: bool,
+        event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
         took_ms: u32,
         hits: &[SearchEventHit],
         docs: u64,
         avgdl: f64,
     ) {
+        let event_kinds = event_kinds
+            .map(|kinds| kinds.iter().map(|kind| kind.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
         let metadata_json = match serde_json::to_string(&json!({
             "docs": docs,
             "avgdl": avgdl,
             "k1": self.cfg.bm25_k1,
-            "b": self.cfg.bm25_b
+            "b": self.cfg.bm25_b,
+            "event_kinds": event_kinds
         })) {
             Ok(value) => value,
             Err(err) => {
@@ -2961,6 +3106,7 @@ FORMAT JSONEachRow",
         let include_tool_events = query
             .include_tool_events
             .unwrap_or(self.cfg.default_include_tool_events);
+        let event_kinds = Self::normalize_event_kinds(query.event_kinds)?;
         let exclude_codex_mcp = query
             .exclude_codex_mcp
             .unwrap_or(self.cfg.default_exclude_codex_mcp);
@@ -3002,6 +3148,7 @@ FORMAT JSONEachRow",
                     docs,
                     avgdl,
                     include_tool_events,
+                    event_kinds.as_deref(),
                     exclude_codex_mcp,
                     session_id,
                     min_should_match,
@@ -3016,6 +3163,7 @@ FORMAT JSONEachRow",
                 &terms,
                 effective_strategy,
                 include_tool_events,
+                event_kinds.as_deref(),
                 exclude_codex_mcp,
                 session_id,
                 min_should_match,
@@ -3033,6 +3181,7 @@ FORMAT JSONEachRow",
                         docs,
                         avgdl,
                         include_tool_events,
+                        event_kinds.as_deref(),
                         exclude_codex_mcp,
                         session_id,
                         min_should_match,
@@ -3060,6 +3209,7 @@ FORMAT JSONEachRow",
                 min_should_match,
                 min_score,
                 include_tool_events,
+                event_kinds.as_deref(),
                 exclude_codex_mcp,
                 took_ms,
                 &hits,
@@ -3450,7 +3600,9 @@ mod tests {
         let mut row = sample_search_doc();
         row.has_codex_mcp = 1;
         assert!(
-            !ClickHouseConversationRepository::passes_search_doc_filters(&row, false, true, None)
+            !ClickHouseConversationRepository::passes_search_doc_filters(
+                &row, false, None, true, None
+            )
         );
     }
 
@@ -3459,7 +3611,79 @@ mod tests {
         let mut row = sample_search_doc();
         row.name = "search".to_string();
         assert!(
-            !ClickHouseConversationRepository::passes_search_doc_filters(&row, false, true, None)
+            !ClickHouseConversationRepository::passes_search_doc_filters(
+                &row, false, None, true, None
+            )
+        );
+    }
+
+    #[test]
+    fn search_doc_filters_event_kinds_override_include_tool_toggle() {
+        let mut row = sample_search_doc();
+        row.event_class = "tool_result".to_string();
+        row.payload_type = "tool_result".to_string();
+
+        assert!(ClickHouseConversationRepository::passes_search_doc_filters(
+            &row,
+            false,
+            Some(&[SearchEventKind::ToolResult]),
+            false,
+            None
+        ));
+        assert!(
+            !ClickHouseConversationRepository::passes_search_doc_filters(
+                &row,
+                true,
+                Some(&[SearchEventKind::Message]),
+                false,
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn search_doc_filters_map_event_msg_reasoning() {
+        let mut row = sample_search_doc();
+        row.event_class = "event_msg".to_string();
+        row.payload_type = "agent_reasoning".to_string();
+
+        assert!(ClickHouseConversationRepository::passes_search_doc_filters(
+            &row,
+            true,
+            Some(&[SearchEventKind::Reasoning]),
+            false,
+            None
+        ));
+        assert!(
+            !ClickHouseConversationRepository::passes_search_doc_filters(
+                &row,
+                true,
+                Some(&[SearchEventKind::Message]),
+                false,
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn normalize_event_kinds_rejects_empty_lists() {
+        let result = ClickHouseConversationRepository::normalize_event_kinds(Some(vec![]));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_event_kinds_sorts_and_deduplicates() {
+        let normalized = ClickHouseConversationRepository::normalize_event_kinds(Some(vec![
+            SearchEventKind::ToolResult,
+            SearchEventKind::Message,
+            SearchEventKind::ToolResult,
+        ]))
+        .expect("normalize should succeed")
+        .expect("normalized kinds should be present");
+
+        assert_eq!(
+            normalized,
+            vec![SearchEventKind::Message, SearchEventKind::ToolResult]
         );
     }
 
