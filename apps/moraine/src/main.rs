@@ -11,7 +11,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -553,8 +553,34 @@ fn pid_path(paths: &RuntimePaths, service: Service) -> PathBuf {
     paths.pids_dir.join(service.pid_file())
 }
 
+fn clickhouse_internal_log_path(paths: &RuntimePaths) -> PathBuf {
+    paths
+        .clickhouse_root
+        .join("log")
+        .join("clickhouse-server.log")
+}
+
+fn legacy_clickhouse_pipe_log_path(paths: &RuntimePaths) -> PathBuf {
+    paths.logs_dir.join(Service::ClickHouse.log_file())
+}
+
+fn cleanup_legacy_clickhouse_pipe_log(paths: &RuntimePaths) {
+    let legacy_log = legacy_clickhouse_pipe_log_path(paths);
+    let should_remove = fs::metadata(&legacy_log)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false);
+    if should_remove {
+        let _ = fs::remove_file(legacy_log);
+    }
+}
+
 fn log_path(paths: &RuntimePaths, service: Service) -> PathBuf {
-    paths.logs_dir.join(service.log_file())
+    match service {
+        Service::ClickHouse => clickhouse_internal_log_path(paths),
+        Service::Ingest | Service::Monitor | Service::Mcp => {
+            paths.logs_dir.join(service.log_file())
+        }
+    }
 }
 
 fn read_pid(path: &Path) -> Option<u32> {
@@ -1077,24 +1103,17 @@ async fn start_clickhouse(cfg: &AppConfig, paths: &RuntimePaths) -> Result<Start
         });
     }
 
+    cleanup_legacy_clickhouse_pipe_log(paths);
+
     let server_bin = resolve_clickhouse_server_command(cfg, paths).await?;
 
     materialize_clickhouse_config(cfg, paths)?;
 
-    let logfile = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path(paths, Service::ClickHouse))
-        .context("failed to open clickhouse log file")?;
-    let logfile_err = logfile
-        .try_clone()
-        .context("failed to clone clickhouse log file")?;
-
     let child = Command::new(&server_bin)
         .arg("--config-file")
         .arg(&paths.clickhouse_config)
-        .stdout(Stdio::from(logfile))
-        .stderr(Stdio::from(logfile_err))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("failed to start {}", server_bin.display()))?;
 
@@ -1608,8 +1627,55 @@ async fn cmd_status(paths: &RuntimePaths, cfg: &AppConfig) -> Result<StatusSnaps
 }
 
 fn tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
-    let content = fs::read_to_string(path)
+    const TAIL_READ_CHUNK_BYTES: usize = 8 * 1024;
+
+    if lines == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut file = fs::File::open(path)
         .with_context(|| format!("failed to read log file {}", path.display()))?;
+    let mut position = file
+        .metadata()
+        .with_context(|| format!("failed to read log file {}", path.display()))?
+        .len();
+
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut scratch = vec![0_u8; TAIL_READ_CHUNK_BYTES];
+    let mut newline_count = 0usize;
+    while position > 0 {
+        let read_len = (position as usize).min(TAIL_READ_CHUNK_BYTES);
+        position -= read_len as u64;
+        file.seek(SeekFrom::Start(position))
+            .with_context(|| format!("failed to read log file {}", path.display()))?;
+        file.read_exact(&mut scratch[..read_len])
+            .with_context(|| format!("failed to read log file {}", path.display()))?;
+        newline_count += scratch[..read_len]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        chunks.push(scratch[..read_len].to_vec());
+        if newline_count > lines {
+            break;
+        }
+    }
+
+    let total_len = chunks.iter().map(Vec::len).sum();
+    let mut bytes = Vec::with_capacity(total_len);
+    for chunk in chunks.iter().rev() {
+        bytes.extend_from_slice(chunk);
+    }
+
+    let start = if position > 0 {
+        bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |idx| idx + 1)
+    } else {
+        0
+    };
+    let content = std::str::from_utf8(&bytes[start..])
+        .with_context(|| format!("failed to decode log file {} as utf-8", path.display()))?;
     let mut collected = content
         .lines()
         .rev()
@@ -2294,6 +2360,35 @@ mod tests {
     }
 
     #[test]
+    fn tail_lines_returns_last_n_without_trailing_newline() {
+        let root = temp_dir("tail-lines-basic");
+        let path = root.join("test.log");
+        fs::write(&path, "one\ntwo\nthree").expect("write log");
+
+        let lines = tail_lines(&path, 2).expect("tail lines");
+        assert_eq!(lines, vec!["two".to_string(), "three".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tail_lines_handles_utf8_chunk_boundary() {
+        let root = temp_dir("tail-lines-utf8");
+        let path = root.join("test.log");
+        let prefix = "é".repeat(4500);
+        let content = format!("{prefix}\nmiddle\ntail\n");
+        fs::write(&path, content).expect("write log");
+
+        let one = tail_lines(&path, 1).expect("tail one line");
+        assert_eq!(one, vec!["tail".to_string()]);
+
+        let two = tail_lines(&path, 2).expect("tail two lines");
+        assert_eq!(two, vec!["middle".to_string(), "tail".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn clickhouse_asset_selection_covers_target_matrix() {
         let linux_x64 =
             clickhouse_asset_for_target(DEFAULT_CLICKHOUSE_TAG, "x86_64-unknown-linux-gnu")
@@ -2327,6 +2422,49 @@ mod tests {
             "{}",
             err
         );
+    }
+
+    #[test]
+    fn clickhouse_logs_use_internal_rotating_path() {
+        let root = temp_dir("clickhouse-log-path");
+        let logs_dir = root.join("logs");
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+        cfg.runtime.logs_dir = logs_dir.to_string_lossy().to_string();
+        let paths = runtime_paths(&cfg);
+
+        assert_eq!(
+            log_path(&paths, Service::ClickHouse),
+            root.join("clickhouse/log/clickhouse-server.log")
+        );
+        assert_eq!(
+            log_path(&paths, Service::Ingest),
+            logs_dir.join("ingest.log")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_legacy_clickhouse_pipe_log_removes_legacy_file() {
+        let root = temp_dir("legacy-clickhouse-log");
+        let logs_dir = root.join("logs");
+        fs::create_dir_all(&logs_dir).expect("create logs dir");
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.root_dir = root.to_string_lossy().to_string();
+        cfg.runtime.logs_dir = logs_dir.to_string_lossy().to_string();
+        let paths = runtime_paths(&cfg);
+
+        let legacy_log = legacy_clickhouse_pipe_log_path(&paths);
+        fs::write(&legacy_log, b"legacy clickhouse stdout").expect("write legacy log");
+        assert!(legacy_log.exists());
+
+        cleanup_legacy_clickhouse_pipe_log(&paths);
+        assert!(!legacy_log.exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
