@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 enum ActiveWatcher {
     Recommended(RecommendedWatcher),
@@ -169,17 +169,17 @@ fn queue_rescan(
             }
         }
         Err(exc) => {
-            error!(
+            warn!(
                 source = source_name,
                 provider,
                 glob_pattern,
                 error = %exc,
-                "watcher rescan enumeration failed"
+                "watcher rescan failed to enumerate jsonl files"
             );
             record_watcher_error(
                 metrics,
                 &format!(
-                    "watcher rescan enumeration failed for source={source_name}, provider={provider}, glob={glob_pattern}: {exc}"
+                    "rescan enumerate failed for source={source_name} provider={provider} glob={glob_pattern}: {exc}"
                 ),
             );
         }
@@ -373,7 +373,7 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
-    use tokio::sync::mpsc::error::TryRecvError;
+    use tokio::sync::mpsc;
 
     #[test]
     fn rescan_events_require_reconcile() {
@@ -423,22 +423,24 @@ mod tests {
     }
 
     #[test]
-    fn queue_rescan_records_enumeration_failures() {
+    fn queue_rescan_records_enumeration_errors() {
         let metrics = Arc::new(Metrics::default());
-        let (tx, mut rx) = mpsc::unbounded_channel::<WorkItem>();
+        let (tx, mut rx) = mpsc::unbounded_channel();
 
-        queue_rescan("[", "source-a", "provider-a", &tx, &metrics);
+        queue_rescan("[", "source-alpha", "provider-alpha", &tx, &metrics);
 
-        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(rx.try_recv().is_err());
         assert_eq!(metrics.watcher_reset_count.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.watcher_error_count.load(Ordering::Relaxed), 1);
+
         let last_error = metrics
             .last_error
             .lock()
             .expect("metrics last_error mutex poisoned")
             .clone();
-        assert!(last_error.contains("watcher rescan enumeration failed"));
-        assert!(last_error.contains("source=source-a"));
-        assert!(last_error.contains("provider=provider-a"));
+        assert!(last_error.contains("rescan enumerate failed"));
+        assert!(last_error.contains("source=source-alpha"));
+        assert!(last_error.contains("provider=provider-alpha"));
+        assert!(last_error.contains("glob=["));
     }
 }
