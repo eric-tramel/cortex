@@ -2799,6 +2799,38 @@ async fn main() -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                original: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn lock_env_vars() -> MutexGuard<'static, ()> {
+        ENV_VAR_LOCK.lock().expect("env-var lock poisoned")
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let stamp = SystemTime::now()
@@ -3126,6 +3158,10 @@ mod tests {
 
     #[test]
     fn resolve_service_binary_prefers_env_then_config() {
+        let _env_lock = lock_env_vars();
+        let _service_bin_dir_guard = EnvVarGuard::capture("MORAINE_SERVICE_BIN_DIR");
+        let _source_tree_mode_guard = EnvVarGuard::capture("MORAINE_SOURCE_TREE_MODE");
+
         let root = temp_dir("resolver");
         let env_dir = root.join("env");
         let cfg_dir = root.join("cfg");
@@ -3156,6 +3192,10 @@ mod tests {
 
     #[test]
     fn resolve_service_binary_reports_missing_without_path_fallback() {
+        let _env_lock = lock_env_vars();
+        let _service_bin_dir_guard = EnvVarGuard::capture("MORAINE_SERVICE_BIN_DIR");
+        let _source_tree_mode_guard = EnvVarGuard::capture("MORAINE_SOURCE_TREE_MODE");
+
         let root = temp_dir("resolver-path");
         let mut cfg = AppConfig::default();
         cfg.runtime.service_bin_dir = root.join("missing").to_string_lossy().to_string();
@@ -3177,6 +3217,10 @@ mod tests {
 
     #[test]
     fn require_service_binary_includes_remediation() {
+        let _env_lock = lock_env_vars();
+        let _service_bin_dir_guard = EnvVarGuard::capture("MORAINE_SERVICE_BIN_DIR");
+        let _source_tree_mode_guard = EnvVarGuard::capture("MORAINE_SOURCE_TREE_MODE");
+
         let root = temp_dir("resolver-remediation");
         let mut cfg = AppConfig::default();
         cfg.runtime.service_bin_dir = root.join("missing").to_string_lossy().to_string();

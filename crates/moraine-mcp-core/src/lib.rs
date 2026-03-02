@@ -303,7 +303,7 @@ struct SessionListProseSession {
     #[serde(default)]
     event_count: u64,
     #[serde(default)]
-    harness_type: String,
+    mode: String,
 }
 
 #[derive(Clone)]
@@ -387,7 +387,7 @@ impl AppState {
             "tools": [
                 {
                     "name": "search",
-                    "description": "BM25 lexical search over Moraine indexed conversation events.",
+                    "description": "BM25 lexical search over Moraine indexed conversation events. Bag-of-words ranking: no phrase matching, no stemming. Word order does not matter.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -395,7 +395,7 @@ impl AppState {
                             "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
                             "session_id": { "type": "string" },
                             "min_score": { "type": "number" },
-                            "min_should_match": { "type": "integer", "minimum": 1 },
+                            "min_should_match": { "type": "integer", "minimum": 1, "description": "Minimum number of query terms that must match. Values exceeding the number of query terms are clamped." },
                             "include_tool_events": { "type": "boolean" },
                             "event_kind": {
                                 "oneOf": [
@@ -452,7 +452,7 @@ impl AppState {
                             "query": { "type": "string" },
                             "limit": { "type": "integer", "minimum": limit_min, "maximum": limit_max },
                             "min_score": { "type": "number" },
-                            "min_should_match": { "type": "integer", "minimum": 1 },
+                            "min_should_match": { "type": "integer", "minimum": 1, "description": "Minimum number of query terms that must match. Values exceeding the number of query terms are clamped." },
                             "from_unix_ms": { "type": "integer" },
                             "to_unix_ms": { "type": "integer" },
                             "mode": {
@@ -483,7 +483,8 @@ impl AppState {
                             "to_unix_ms": { "type": "integer" },
                             "mode": {
                                 "type": "string",
-                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat"]
+                                "enum": ["web_search", "mcp_internal", "tool_calling", "chat"],
+                                "description": SEARCH_CONVERSATIONS_MODE_DOC
                             },
                             "verbosity": {
                                 "type": "string",
@@ -665,7 +666,7 @@ impl AppState {
                     "assistant_messages": summary.assistant_messages,
                     "tool_calls": summary.tool_calls,
                     "tool_results": summary.tool_results,
-                    "harness_type": summary.mode.as_str(),
+                    "mode": summary.mode.as_str(),
                 })
             })
             .collect::<Vec<_>>();
@@ -991,17 +992,17 @@ fn format_session_list_prose(payload: &Value) -> Result<String> {
     }
 
     for (idx, session) in parsed.sessions.iter().enumerate() {
-        let harness = if session.harness_type.is_empty() {
+        let mode = if session.mode.is_empty() {
             "chat"
         } else {
-            session.harness_type.as_str()
+            session.mode.as_str()
         };
 
         out.push_str(&format!(
-            "\n{}) session={} harness={} events={}\n",
+            "\n{}) session={} mode={} events={}\n",
             idx + 1,
             session.session_id,
-            harness,
+            mode,
             session.event_count
         ));
         out.push_str(&format!(
@@ -1380,7 +1381,7 @@ mod tests {
                     "end_time": "2026-01-02 12:05:00",
                     "end_unix_ms": 1767355500000_i64,
                     "event_count": 22_u64,
-                    "harness_type": "web_search"
+                    "mode": "web_search"
                 }
             ],
             "next_cursor": "cursor-token"
@@ -1388,7 +1389,7 @@ mod tests {
 
         let text = format_session_list_prose(&payload).expect("format");
         assert!(text.contains("session=sess-1"));
-        assert!(text.contains("harness=web_search"));
+        assert!(text.contains("mode=web_search"));
         assert!(text.contains("next_cursor: cursor-token"));
     }
 }
