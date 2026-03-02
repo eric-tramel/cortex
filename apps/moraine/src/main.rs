@@ -2265,9 +2265,7 @@ fn load_install_receipt() -> Result<InstallReceipt> {
 
 async fn fetch_latest_release(repo: &str) -> Result<GitHubRelease> {
     let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-    let client = Client::builder()
-        .user_agent("moraine-updater")
-        .build()?;
+    let client = Client::builder().user_agent("moraine-updater").build()?;
     let resp = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
@@ -2394,8 +2392,7 @@ async fn cmd_update(args: &UpdateArgs) -> Result<UpdateOutcome> {
     if !manifest_path.exists() {
         bail!("update bundle missing manifest.json");
     }
-    let manifest: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&manifest_path)?)?;
 
     if let Some(manifest_target) = manifest.get("target").and_then(|v| v.as_str()) {
         if manifest_target != target_triple {
@@ -2443,20 +2440,11 @@ async fn cmd_update(args: &UpdateArgs) -> Result<UpdateOutcome> {
         let tmp_dest = install_dir.join(format!(".{}.update.tmp", bin));
         let final_dest = install_dir.join(bin);
 
-        fs::copy(&src, &tmp_dest).with_context(|| {
-            format!(
-                "failed to stage {} to {}",
-                bin,
-                tmp_dest.display()
-            )
-        })?;
+        fs::copy(&src, &tmp_dest)
+            .with_context(|| format!("failed to stage {} to {}", bin, tmp_dest.display()))?;
         make_executable(&tmp_dest)?;
-        fs::rename(&tmp_dest, &final_dest).with_context(|| {
-            format!(
-                "failed to atomically replace {}",
-                final_dest.display()
-            )
-        })?;
+        fs::rename(&tmp_dest, &final_dest)
+            .with_context(|| format!("failed to atomically replace {}", final_dest.display()))?;
     }
 
     // Replace web assets
@@ -2526,10 +2514,7 @@ async fn cmd_update(args: &UpdateArgs) -> Result<UpdateOutcome> {
         install_dir: receipt.install_dir.clone(),
         binaries: receipt.binaries.clone(),
         installed_at_utc: now_utc,
-        requested_version: args
-            .version
-            .clone()
-            .unwrap_or_else(|| "latest".to_string()),
+        requested_version: args.version.clone().unwrap_or_else(|| "latest".to_string()),
         asset_url,
         checksum_url,
     };
