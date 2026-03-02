@@ -1600,13 +1600,27 @@ FORMAT JSONEachRow",
                 || row.payload_type == "event_msg")
     }
 
+    fn is_reasoning_search_row(row: &SearchRow) -> bool {
+        row.event_class == "reasoning"
+    }
+
+    fn is_event_msg_reasoning_search_row(row: &SearchRow) -> bool {
+        row.event_class == "event_msg" && row.payload_type == "agent_reasoning"
+    }
+
     fn compact_preview_for_dedup(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     fn search_rows_are_mirrors(a: &SearchRow, b: &SearchRow) -> bool {
-        let same_kind_pair = (Self::is_message_search_row(a) && Self::is_event_msg_search_row(b))
+        let is_message_pair = (Self::is_message_search_row(a)
+            && Self::is_event_msg_search_row(b))
             || (Self::is_event_msg_search_row(a) && Self::is_message_search_row(b));
+        let is_reasoning_pair = (Self::is_reasoning_search_row(a)
+            && Self::is_event_msg_reasoning_search_row(b))
+            || (Self::is_event_msg_reasoning_search_row(a)
+                && Self::is_reasoning_search_row(b));
+        let same_kind_pair = is_message_pair || is_reasoning_pair;
         if !same_kind_pair {
             return false;
         }
@@ -1627,9 +1641,11 @@ FORMAT JSONEachRow",
     }
 
     fn search_row_kind_priority(row: &SearchRow) -> u8 {
-        if Self::is_message_search_row(row) {
+        if Self::is_message_search_row(row) || Self::is_reasoning_search_row(row) {
             0
-        } else if Self::is_event_msg_search_row(row) {
+        } else if Self::is_event_msg_search_row(row)
+            || Self::is_event_msg_reasoning_search_row(row)
+        {
             1
         } else {
             2
@@ -3088,7 +3104,7 @@ FORMAT JSONEachRow",
 
         let terms_with_qf = tokenize_query(query_text, self.cfg.bm25_max_query_terms);
         if terms_with_qf.is_empty() {
-            return Err(RepoError::invalid_argument("query has no searchable terms"));
+            return Err(RepoError::invalid_argument("query has no searchable terms (tokens shorter than 2 characters are excluded)"));
         }
         let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
 
@@ -3252,7 +3268,7 @@ FORMAT JSONEachRow",
 
         let terms_with_qf = tokenize_query(query_text, self.cfg.bm25_max_query_terms);
         if terms_with_qf.is_empty() {
-            return Err(RepoError::invalid_argument("query has no searchable terms"));
+            return Err(RepoError::invalid_argument("query has no searchable terms (tokens shorter than 2 characters are excluded)"));
         }
         let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
 
@@ -3785,6 +3801,66 @@ mod tests {
             ),
             sample_search_row(
                 "uid-2",
+                "sess-a",
+                "message",
+                "message",
+                "assistant",
+                "same text",
+                10.0,
+                2,
+            ),
+        ];
+
+        let deduped = ClickHouseConversationRepository::dedupe_search_rows(rows, 5);
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn dedupe_search_rows_prefers_reasoning_over_event_msg_reasoning_mirror() {
+        let rows = vec![
+            sample_search_row(
+                "uid-event-msg-reasoning",
+                "sess-a",
+                "event_msg",
+                "agent_reasoning",
+                "assistant",
+                "Let me think about this",
+                12.50,
+                2,
+            ),
+            sample_search_row(
+                "uid-reasoning",
+                "sess-a",
+                "reasoning",
+                "reasoning",
+                "assistant",
+                "Let me think about this",
+                12.50,
+                2,
+            ),
+        ];
+
+        let deduped = ClickHouseConversationRepository::dedupe_search_rows(rows, 5);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].event_uid, "uid-reasoning");
+        assert_eq!(deduped[0].event_class, "reasoning");
+    }
+
+    #[test]
+    fn dedupe_search_rows_reasoning_mirrors_do_not_collapse_with_messages() {
+        let rows = vec![
+            sample_search_row(
+                "uid-reasoning",
+                "sess-a",
+                "reasoning",
+                "reasoning",
+                "assistant",
+                "same text",
+                10.0,
+                2,
+            ),
+            sample_search_row(
+                "uid-message",
                 "sess-a",
                 "message",
                 "message",
